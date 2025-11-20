@@ -16,3 +16,9 @@ After loging in with the ETH account you need to past the provided command into 
 Also you need to install the following packages: gurobipy, pandas, plotly
 
 IMPORTANT: To run the gurobi optimization a python installation of version 3.13 or LESS is needed. 3.14 does not work!
+
+Use a python virtual environment to run it, package requirements in requirements.txt.
+Steps to run:
+1. Activate the virtual environment
+2. Ensure gurobi is installed ad enabled
+3. python3 model.py
