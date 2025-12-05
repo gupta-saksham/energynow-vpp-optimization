@@ -145,6 +145,8 @@ def build_battery_model(T,
         return sum((m.C_buy[t] * m.P_buy[t] - m.C_sell[t] * m.P_sell[t])*delta_t for t in m.T) + m.P_peak * m.C_peak + I0*(SOH0 - m.SOH[T])/(SOH0 - 0.8)
     model.Obj = Objective(rule=objective_rule, sense=minimize)
 
+
+
     return model
 
 
