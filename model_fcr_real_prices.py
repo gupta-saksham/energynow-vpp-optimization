@@ -6,8 +6,12 @@ import numpy as np
 import plotly.graph_objects as go
 from pathlib import Path
 from data_utils import load_and_process_data, generate_fcr_activation_profile
+from plotly.subplots import make_subplots
+import pandas as pd
+from pyomo.environ import value
 this_file = Path(__file__).parent
 def plot_results(model):
+
     data = pd.DataFrame({
         'P_ch': [value(model.P_ch[t]) for t in model.T],
         'P_dis': [value(model.P_dis[t]) for t in model.T],
@@ -121,6 +125,168 @@ def plot_results(model):
     )
 
     fig.write_html("charge_plot_with_SOH.html")
+
+
+
+def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
+    """
+    Generates a Dashboard with explicit directional labeling (Charge vs Discharge).
+    Fixed: Variable naming mismatch (P_BTM vs P_BTM_Net).
+    """
+    print("Extracting data for visualization...")
+    
+    # --- 1. DATA PREP ---
+    if E_nom is None:
+        if hasattr(model, 'E_bat_max'):
+            E_nom = value(model.E_bat_max)
+        else:
+            raise ValueError("Please provide E_nom (Total Battery Capacity in kWh).")
+
+    records = []
+    is_split = hasattr(model, 'P_ch_BTM')
+
+    for t in model.T:
+        # Basic values
+        price = value(model.C_buy[t])
+        demand = value(model.D[t])
+        p_buy = value(model.P_buy[t])
+        p_sell = value(model.P_sell[t])
+        
+        # Grid Net: What the meter sees
+        # Positive = Taking from Grid, Negative = Pushing to Grid
+        grid_net = p_buy - p_sell
+        
+        # Battery Net: 
+        # Positive = Charging (Adding to Load), Negative = Discharging (Helping)
+        if is_split:
+            p_btm_net = value(model.P_ch_BTM[t]) - value(model.P_dis_BTM[t])
+            p_ftm_net = value(model.P_ch_FTM[t]) - value(model.P_dis_FTM[t])
+            soc_kwh = value(model.SOC_BTM[t]) + value(model.SOC_FTM[t])
+            p_fcr_bid = value(model.P_FCR_bid[t])
+        else:
+            p_btm_net = value(model.P_ch[t]) - value(model.P_dis[t])
+            p_ftm_net = 0
+            soc_kwh = value(model.SOC[t])
+            p_fcr_bid = 0
+
+        # Total Battery Flow
+        batt_total_net = p_btm_net + p_ftm_net
+        
+        # SOC %
+        current_cap = E_nom * value(model.SOH[t])
+        soc_pct = (soc_kwh / current_cap * 100) if current_cap > 0 else 0
+
+        # Financials
+        cost_base = demand * delta_t * price
+        fcr_rev = p_fcr_bid * (value(model.C_FCR[t]) if hasattr(model, 'C_FCR') else 0) * delta_t
+        cost_opt = (grid_net * delta_t * price) - fcr_rev 
+
+        records.append({
+            't': t, 'Price': price, 'Demand': demand, 'Grid_Net': grid_net,
+            'Batt_Net': batt_total_net, 
+            'P_BTM_Net': p_btm_net, # <--- FIXED: Added _Net suffix
+            'P_FTM_Net': p_ftm_net, # <--- FIXED: Added _Net suffix
+            'SOC_Pct': soc_pct, 'SOC_kWh': soc_kwh,
+            'Cost_Base': cost_base, 'Cost_Opt': cost_opt,
+            'P_peak': value(model.P_peak)
+        })
+
+    df = pd.DataFrame(records)
+    start_time = pd.Timestamp("2024-01-01 00:00")
+    df.index = [start_time + pd.Timedelta(minutes=15*t) for t in df['t']]
+    
+    df['Cum_Cost_Base'] = df['Cost_Base'].cumsum()
+    df['Cum_Cost_Opt'] = df['Cost_Opt'].cumsum()
+
+    # --- 2. PLOTTING ---
+    fig = make_subplots(
+        rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+        subplot_titles=(
+            "1. GRID: What enters/leaves your building connection?",
+            "2. BATTERY: Charging (Red) vs. Discharging (Green)",
+            "3. BATTERY STATE: SOC (%) vs Price",
+            "4. WALLET: Cumulative Cost"
+        ),
+        specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"secondary_y": True}], [{"secondary_y": False}]]
+    )
+
+    # --- ROW 1: GRID INTERACTION ---
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Demand'], name='Original Load',
+        fill='tozeroy', line=dict(color='lightgrey', width=0),
+        hoverinfo='skip' 
+    ), row=1, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Grid_Net'], name='Final Grid Profile',
+        line=dict(color='black', width=2),
+        hovertemplate='Grid Power: %{y:.1f} kW'
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(x=df.index, y=[df['P_peak'].max()]*len(df), name='Peak Limit',
+                             line=dict(color='red', dash='dot', width=1)), row=1, col=1)
+
+    # --- ROW 2: BATTERY BEHAVIOR (Split by Color) ---
+    # BTM Flow
+    fig.add_trace(go.Bar(
+        x=df.index, y=df['P_BTM_Net'], name='BTM Flow',
+        marker=dict(color=df['P_BTM_Net'].apply(lambda x: 'rgba(214, 39, 40, 0.7)' if x >= 0 else 'rgba(44, 160, 44, 0.7)')),
+        marker_line_width=0
+    ), row=2, col=1)
+    
+    # FTM Flow
+    fig.add_trace(go.Bar(
+        x=df.index, y=df['P_FTM_Net'], name='FTM Flow',
+        marker=dict(color=df['P_FTM_Net'].apply(lambda x: 'rgba(255, 127, 14, 0.7)' if x >= 0 else 'rgba(31, 119, 180, 0.7)')),
+        marker_line_width=0
+    ), row=2, col=1)
+
+    # --- ROW 3: SOC & Price ---
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['SOC_Pct'], name='SOC %',
+        line=dict(color='green', width=2),
+        hovertemplate='%{y:.1f}%',
+    ), row=3, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=df.index, y=df['Price'], name='Price',
+        line=dict(color='red', width=1), opacity=0.5
+    ), row=3, col=1, secondary_y=True)
+
+    # --- ROW 4: Financials ---
+    fig.add_trace(go.Scatter(x=df.index, y=df['Cum_Cost_Base'], name='Base Cost',
+                             line=dict(color='grey', dash='dash')), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Cum_Cost_Opt'], name='Optimized Cost',
+                             line=dict(color='blue')), row=4, col=1)
+
+    # --- LAYOUT & ANNOTATIONS ---
+    fig.update_layout(height=1200, template="plotly_white", barmode='relative', hovermode="x unified")
+    
+    # Text Annotations
+    fig.add_annotation(xref="paper", yref="y1", x=0.01, y=df['Demand'].max(),
+                       text="Positive = Import (Buying)", showarrow=False, font=dict(color="black", size=10))
+    fig.add_annotation(xref="paper", yref="y1", x=0.01, y=-10,
+                       text="Negative = Export (Selling)", showarrow=False, font=dict(color="black", size=10))
+
+    fig.add_annotation(xref="paper", yref="y2", x=0.01, y=df['Batt_Net'].max(),
+                       text="Positive = CHARGING (Consuming)", showarrow=False, font=dict(color="red", size=10))
+    fig.add_annotation(xref="paper", yref="y2", x=0.01, y=df['Batt_Net'].min(),
+                       text="Negative = DISCHARGING (Supplying)", showarrow=False, font=dict(color="green", size=10))
+
+    # Axis Titles
+    fig.update_yaxes(title_text="Grid Power (kW)", row=1, col=1)
+    fig.update_yaxes(title_text="Battery Power (kW)", row=2, col=1)
+    fig.update_yaxes(title_text="SOC (%)", row=3, col=1, range=[0, 105])
+    fig.update_yaxes(title_text="Eur", row=4, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=True), row=4, col=1)
+
+    print("Saving clearer plot to 'optimization_dashboard_v3.html'...")
+    fig.write_html("optimization_dashboard_v3.html")
+    fig.show()
+
+
+
+    
 #%%
 
 
@@ -142,9 +308,6 @@ def build_split_battery_model(T,
     model.T = RangeSet(0, T)
     model.Tstep = RangeSet(0, T-1)
     
-    # FCR Block Logic
-    block_size = int(round(4.0 / delta_t))
-    
     # --- Parameters ---
     model.delta_t = Param(initialize=delta_t)
     model.btm_ratio = Param(initialize=btm_ratio)
@@ -157,6 +320,7 @@ def build_split_battery_model(T,
     
     # FCR Parameters
     model.FCR_signal = Param(model.T, initialize=lambda m, t: FCR_signal[t])
+    # Binary param indicating if FCR is active (for reference, though unused in logic below)
     model.FCR_active = Param(model.T, initialize=lambda m, t: 1 if abs(FCR_signal[t]) > 0 else 0, within=Binary)
     
     # Calculate Max Power per Partition
@@ -176,24 +340,22 @@ def build_split_battery_model(T,
     model.SOC_FTM = Var(model.T, within=NonNegativeReals, bounds=(0, E_bat_max * (1-btm_ratio)))
     
     # FCR Logic Variables
-    # We allow variable bidding up to the FTM capacity limit
     model.P_FCR_bid = Var(model.T, within=NonNegativeReals, bounds=(0, ftm_p_max))
     model.u_FCR = Var(model.T, within=Binary)
     
     # Grid Exchange (Global)
     model.P_buy = Var(model.T, within=NonNegativeReals, bounds=(0, P_buy_max))
     model.P_sell = Var(model.T, within=NonNegativeReals, bounds=(0, P_sell_max))
-    model.P_peak = Var(within=NonNegativeReals) # Determine by BTM behavior + Load
+    model.P_peak = Var(within=NonNegativeReals)
     
     # SOH Variables (Global Physical Battery)
     model.SOH = Var(model.T, within=NonNegativeReals, bounds=(0, 1.0))
-    model.E_bat_current = Var(model.T, within=NonNegativeReals) # Actual max cap based on SOH
+    model.E_bat_current = Var(model.T, within=NonNegativeReals)
 
     # --- Constraints ---
 
     # 1. Initialization
     def init_soc(m):
-        # We split initial energy according to the ratio
         return m.SOC_BTM[0] == SOC0 * E_bat_max * m.btm_ratio
     model.Init_SOC_BTM = Constraint(rule=init_soc)
     
@@ -203,21 +365,17 @@ def build_split_battery_model(T,
     
     model.Init_SOH = Constraint(rule=lambda m: m.SOH[0] == SOH0)
 
-    # 2. SOC Balances (Strict Separation)
-    
-    # BTM Balance
+    # 2. SOC Balances
     def soc_balance_btm(m, t):
         return m.SOC_BTM[t+1] == m.SOC_BTM[t] + (eta_ch * m.P_ch_BTM[t] - (1/eta_dis) * m.P_dis_BTM[t]) * delta_t
     model.SOC_Balance_BTM = Constraint(model.Tstep, rule=soc_balance_btm)
     
-    # FTM Balance (Includes FCR energy injections)
-    # FCR Signal: (+) = Charge/Absorb, (-) = Discharge/Inject
     def soc_balance_ftm(m, t):
-        fcr_flow = m.P_FCR_bid[t] * m.FCR_signal[t] # Power flow from FCR activation
+        fcr_flow = m.P_FCR_bid[t] * m.FCR_signal[t]
         return m.SOC_FTM[t+1] == m.SOC_FTM[t] + (eta_ch * m.P_ch_FTM[t] - (1/eta_dis) * m.P_dis_FTM[t] + fcr_flow) * delta_t
     model.SOC_Balance_FTM = Constraint(model.Tstep, rule=soc_balance_ftm)
 
-    # 3. Dynamic Capacity Limits (Degradation affects both proportional to ratio)
+    # 3. Dynamic Capacity Limits
     def update_capacity(m, t):
         return m.E_bat_current[t] == E_bat_max * m.SOH[t]
     model.Update_Cap = Constraint(model.T, rule=update_capacity)
@@ -227,33 +385,27 @@ def build_split_battery_model(T,
     model.Max_SOC_BTM = Constraint(model.T, rule=max_soc_btm)
     
     def max_soc_ftm(m, t):
-        # FTM must keep headroom for FCR down-regulation (charging)
-        # If FCR signal is positive (charging), we need space.
-        # Strict reservation: must keep space for full bid * delta_t if activated
-        # Simplified for MILP: Limit SOC to (Max - Headroom)
         return m.SOC_FTM[t] <= (m.E_bat_current[t] * m.ftm_ratio) - (m.P_FCR_bid[t] * delta_t * eta_ch)
     model.Max_SOC_FTM = Constraint(model.T, rule=max_soc_ftm)
 
     def min_soc_ftm(m, t):
-        # FTM must keep footroom for FCR up-regulation (discharging)
         return m.SOC_FTM[t] >= (m.P_FCR_bid[t] * delta_t * (1/eta_dis))
     model.Min_SOC_FTM = Constraint(model.T, rule=min_soc_ftm)
 
     # 4. Global Power Balance (Grid Interface)
     def global_balance(m, t):
-        # Load + Charging(BTM+FTM) = Grid_Buy + Discharging(BTM+FTM) + Grid_Sell
         total_ch = m.P_ch_BTM[t] + m.P_ch_FTM[t]
         total_dis = m.P_dis_BTM[t] + m.P_dis_FTM[t]
-        return m.D[t] + total_ch == m.P_buy[t] + total_dis + m.P_sell[t]
-    model.Global_Balance = Constraint(model.T, rule=global_balance)
+        # Load + Charging + Selling = Buying + Discharging
+        return m.D[t] + total_ch + m.P_sell[t] == m.P_buy[t] + total_dis 
 
-    # 5. Peak Definition (Applies to Grid Buy)
+    model.Global_Balance = Constraint(model.T, rule=global_balance)
+    # 5. Peak Definition
     def peak_rule(m, t):
         return m.P_buy[t] <= m.P_peak
     model.Peak_Def = Constraint(model.T, rule=peak_rule)
 
-    # 6. FCR Constraints
-    # Block rule (4 hours constancy)
+    # 6. FCR Constraints (Block Logic)
     def fcr_block_rule(m, t):
         if t == 0 or t % 16 == 0: return Constraint.Skip
         return m.u_FCR[t] == m.u_FCR[t-1]
@@ -264,31 +416,42 @@ def build_split_battery_model(T,
         return m.P_FCR_bid[t] == m.P_FCR_bid[t-1]
     model.FCR_Bid_Block = Constraint(model.T, rule=fcr_bid_consistency)
 
-    # Link Binary to Bid (Variable Capacity Bidding)
     def fcr_bid_limit(m, t):
         return m.P_FCR_bid[t] <= m.u_FCR[t] * ftm_p_max
     model.FCR_Bid_Limit = Constraint(model.T, rule=fcr_bid_limit)
     
-    # 7. SOH Degradation (Physical Total)
+    # 7. SOH Degradation
     def soh_update(m, t):
-        # Sum of absolute currents from both partitions
         total_p_flow = (m.P_ch_BTM[t] + m.P_dis_BTM[t]) + (m.P_ch_FTM[t] + m.P_dis_FTM[t])
-        # Note: FCR regulation also causes degradation, technically should add |P_FCR_bid * signal|
-        # approximating with just scheduled flow for linearity
         return m.SOH[t+1] == m.SOH[t] - (a + b*(total_p_flow)/V_bat + c*m.SOH[t])*delta_t*3600
     model.SOH_Update = Constraint(model.Tstep, rule=soh_update)
 
+    # --- 8. Daily Cycle Limit (NEW) ---
+    steps_per_day = int(24 / delta_t)
+    num_days = int((T + 1) // steps_per_day)
+    model.Days = RangeSet(0, num_days - 1)
+
+    def daily_cycle_limit_rule(m, d):
+        start_t = d * steps_per_day
+        end_t = start_t + steps_per_day - 1
+        
+        # Sum of scheduled discharge energy (kWh) for the day
+        daily_discharge = sum(
+            (m.P_dis_BTM[t] + m.P_dis_FTM[t]) * delta_t 
+            for t in range(start_t, end_t + 1) if t <= T
+        )
+        # Limit to 2.0 full cycles (2 * Capacity)
+        return daily_discharge <= 2.0 * E_bat_max
+
+    model.Daily_Cycle_Limit = Constraint(model.Days, rule=daily_cycle_limit_rule)
+
     # --- Objective ---
     def objective_rule(m):
-        # Costs
         energy_cost = sum((m.C_buy[t] * m.P_buy[t])*delta_t for t in m.T)
         peak_cost = m.P_peak * C_peak
         deg_cost = I0 * (SOH0 - m.SOH[T]) / (SOH0 - 0.8)
         
-        # Revenues
         energy_revenue = sum((m.C_sell[t] * m.P_sell[t])*delta_t for t in m.T)
-        # FIXED: FCR Revenue Calculation (Price * Bid_Capacity * Time)
-        # Note: C_FCR is usually EUR/MW/hour. If C_FCR input is EUR/kW/hour:
         fcr_revenue = sum(C_FCR[t] * m.P_FCR_bid[t] * delta_t for t in m.T)
         
         return (energy_cost + peak_cost + deg_cost) - (energy_revenue + fcr_revenue)
@@ -297,7 +460,7 @@ def build_split_battery_model(T,
 
     return model
 
-""" def build_battery_model(T,
+def build_battery_model(T,
                         C_buy, # energy cost
                         C_sell,
                         D, # demand
@@ -489,8 +652,7 @@ def build_split_battery_model(T,
     model.Obj = Objective(rule=objective_rule, sense=minimize)
 
     return model
-
- """
+ 
 #laod data and define Parameters
 fcr_prices, day_ahead, load = load_and_process_data(this_file, specific_load='LG 18')
 peak_tarif = 192.66
@@ -542,7 +704,7 @@ model_fixed_rates = build_split_battery_model(
     btm_ratio=btm_ratio
 )
 # Battery model, all values in kWh or kW
-""" model = build_battery_model(
+model = build_battery_model(
     T=T,
     C_buy=day_ahead,
     C_sell=day_ahead,
@@ -565,13 +727,13 @@ model_fixed_rates = build_split_battery_model(
     V_bat = 777,
     C_FCR=fcr_prices,
     FCR_signal=FCR_signal
-) """
+)
 
 solver = SolverFactory('gurobi')
 results = solver.solve(model_fixed_rates, tee=True)
 model_fixed_rates.display()
 
 # Extract data from model
-
+plot_comprehensive_results(model, delta_t=0.25, E_nom=E_2000)
 
 # %%
