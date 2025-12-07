@@ -1,48 +1,12 @@
+#%%
 from pyomo.environ import *
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 from pathlib import Path
+from data_utils import load_and_process_data, generate_fcr_activation_profile
 this_file = Path(__file__).parent
-
-def generate_fcr_activation_profile(num_steps, block_size, eta_ch, eta_dis, seed=None):
-    """
-    Build a random FCR activation profile that triggers exactly once per block.
-    A positive activation means charging (absorbing power), negative means discharging.
-    """
-    rng = np.random.default_rng(seed)
-    profile = np.zeros(num_steps)
-    num_blocks = int(np.ceil(num_steps / block_size))
-    for block in range(num_blocks):
-        start = block * block_size
-        end = min(start + block_size, num_steps)
-        activation_idx = rng.integers(start, end)
-        direction = rng.choice([-1, 1])
-        profile[activation_idx] = eta_ch if direction > 0 else -1.0 / eta_dis
-    return profile
-
-def load_fcr_prices():
-    fcr_df = pd.read_csv(this_file / "FCR prices 2024.csv", sep=";", decimal=",")
-    
-    fcr_df = fcr_df[fcr_df["TENDER_NUMBER"] == 1]
-    
-
-    fcr_df["GERMANY_SETTLEMENTCAPACITY_PRICE_[EUR/MW]"] = (
-        fcr_df["GERMANY_SETTLEMENTCAPACITY_PRICE_[EUR/MW]"]
-        .str.replace(",", ".", regex=False)
-        .astype(float)
-    )
-
-    fcr_prices = fcr_df["GERMANY_SETTLEMENTCAPACITY_PRICE_[EUR/MW]"]/1000 #EUR/kW
-    print(fcr_prices)
-    return fcr_prices
-
-def load_day_ahead_prices():
-    day_ahead_df = pd.read_csv(this_file / "Day ahead.csv")
-    day_ahead = day_ahead_df["Germany/Luxembourg [Eur/MWh]"]/1000 # to get EUR/KWh
-    return day_ahead
-
 def plot_results(model):
     data = pd.DataFrame({
         'P_ch': [value(model.P_ch[t]) for t in model.T],
@@ -157,8 +121,183 @@ def plot_results(model):
     )
 
     fig.write_html("charge_plot_with_SOH.html")
+#%%
 
-def build_battery_model(T,
+
+def build_split_battery_model(T,
+                              C_buy, C_sell, D,
+                              E_bat_max, I0, C_peak,
+                              P_ch_max, P_dis_max,
+                              P_buy_max, P_sell_max,
+                              C_FCR, FCR_signal,
+                              btm_ratio=0.4,  
+                              eta_ch=0.95, eta_dis=0.95,
+                              delta_t=0.25,
+                              SOC0=0.5, SOH0=1.0,
+                              a=0.0, b=0.0, c=0.0, V_bat=777):
+
+    model = ConcreteModel()
+    
+    # --- Sets ---
+    model.T = RangeSet(0, T)
+    model.Tstep = RangeSet(0, T-1)
+    
+    # FCR Block Logic
+    block_size = int(round(4.0 / delta_t))
+    
+    # --- Parameters ---
+    model.delta_t = Param(initialize=delta_t)
+    model.btm_ratio = Param(initialize=btm_ratio)
+    model.ftm_ratio = Param(initialize=1.0 - btm_ratio)
+    
+    # Load and Prices
+    model.D = Param(model.T, initialize=lambda m, t: D[t])
+    model.C_buy = Param(model.T, initialize=lambda m, t: C_buy[t])
+    model.C_sell = Param(model.T, initialize=lambda m, t: C_sell[t])
+    
+    # FCR Parameters
+    model.FCR_signal = Param(model.T, initialize=lambda m, t: FCR_signal[t])
+    model.FCR_active = Param(model.T, initialize=lambda m, t: 1 if abs(FCR_signal[t]) > 0 else 0, within=Binary)
+    
+    # Calculate Max Power per Partition
+    ftm_p_max = P_ch_max * (1.0 - btm_ratio)
+    btm_p_max = P_ch_max * btm_ratio
+    
+    # --- Variables ---
+    
+    # 1. BTM Variables (Load Shifting & Peak Shaving)
+    model.P_ch_BTM = Var(model.T, within=NonNegativeReals, bounds=(0, btm_p_max))
+    model.P_dis_BTM = Var(model.T, within=NonNegativeReals, bounds=(0, btm_p_max))
+    model.SOC_BTM = Var(model.T, within=NonNegativeReals, bounds=(0, E_bat_max * btm_ratio))
+    
+    # 2. FTM Variables (FCR & Arbitrage)
+    model.P_ch_FTM = Var(model.T, within=NonNegativeReals, bounds=(0, ftm_p_max))
+    model.P_dis_FTM = Var(model.T, within=NonNegativeReals, bounds=(0, ftm_p_max))
+    model.SOC_FTM = Var(model.T, within=NonNegativeReals, bounds=(0, E_bat_max * (1-btm_ratio)))
+    
+    # FCR Logic Variables
+    # We allow variable bidding up to the FTM capacity limit
+    model.P_FCR_bid = Var(model.T, within=NonNegativeReals, bounds=(0, ftm_p_max))
+    model.u_FCR = Var(model.T, within=Binary)
+    
+    # Grid Exchange (Global)
+    model.P_buy = Var(model.T, within=NonNegativeReals, bounds=(0, P_buy_max))
+    model.P_sell = Var(model.T, within=NonNegativeReals, bounds=(0, P_sell_max))
+    model.P_peak = Var(within=NonNegativeReals) # Determine by BTM behavior + Load
+    
+    # SOH Variables (Global Physical Battery)
+    model.SOH = Var(model.T, within=NonNegativeReals, bounds=(0, 1.0))
+    model.E_bat_current = Var(model.T, within=NonNegativeReals) # Actual max cap based on SOH
+
+    # --- Constraints ---
+
+    # 1. Initialization
+    def init_soc(m):
+        # We split initial energy according to the ratio
+        return m.SOC_BTM[0] == SOC0 * E_bat_max * m.btm_ratio
+    model.Init_SOC_BTM = Constraint(rule=init_soc)
+    
+    def init_soc_ftm(m):
+        return m.SOC_FTM[0] == SOC0 * E_bat_max * m.ftm_ratio
+    model.Init_SOC_FTM = Constraint(rule=init_soc_ftm)
+    
+    model.Init_SOH = Constraint(rule=lambda m: m.SOH[0] == SOH0)
+
+    # 2. SOC Balances (Strict Separation)
+    
+    # BTM Balance
+    def soc_balance_btm(m, t):
+        return m.SOC_BTM[t+1] == m.SOC_BTM[t] + (eta_ch * m.P_ch_BTM[t] - (1/eta_dis) * m.P_dis_BTM[t]) * delta_t
+    model.SOC_Balance_BTM = Constraint(model.Tstep, rule=soc_balance_btm)
+    
+    # FTM Balance (Includes FCR energy injections)
+    # FCR Signal: (+) = Charge/Absorb, (-) = Discharge/Inject
+    def soc_balance_ftm(m, t):
+        fcr_flow = m.P_FCR_bid[t] * m.FCR_signal[t] # Power flow from FCR activation
+        return m.SOC_FTM[t+1] == m.SOC_FTM[t] + (eta_ch * m.P_ch_FTM[t] - (1/eta_dis) * m.P_dis_FTM[t] + fcr_flow) * delta_t
+    model.SOC_Balance_FTM = Constraint(model.Tstep, rule=soc_balance_ftm)
+
+    # 3. Dynamic Capacity Limits (Degradation affects both proportional to ratio)
+    def update_capacity(m, t):
+        return m.E_bat_current[t] == E_bat_max * m.SOH[t]
+    model.Update_Cap = Constraint(model.T, rule=update_capacity)
+
+    def max_soc_btm(m, t):
+        return m.SOC_BTM[t] <= m.E_bat_current[t] * m.btm_ratio
+    model.Max_SOC_BTM = Constraint(model.T, rule=max_soc_btm)
+    
+    def max_soc_ftm(m, t):
+        # FTM must keep headroom for FCR down-regulation (charging)
+        # If FCR signal is positive (charging), we need space.
+        # Strict reservation: must keep space for full bid * delta_t if activated
+        # Simplified for MILP: Limit SOC to (Max - Headroom)
+        return m.SOC_FTM[t] <= (m.E_bat_current[t] * m.ftm_ratio) - (m.P_FCR_bid[t] * delta_t * eta_ch)
+    model.Max_SOC_FTM = Constraint(model.T, rule=max_soc_ftm)
+
+    def min_soc_ftm(m, t):
+        # FTM must keep footroom for FCR up-regulation (discharging)
+        return m.SOC_FTM[t] >= (m.P_FCR_bid[t] * delta_t * (1/eta_dis))
+    model.Min_SOC_FTM = Constraint(model.T, rule=min_soc_ftm)
+
+    # 4. Global Power Balance (Grid Interface)
+    def global_balance(m, t):
+        # Load + Charging(BTM+FTM) = Grid_Buy + Discharging(BTM+FTM) + Grid_Sell
+        total_ch = m.P_ch_BTM[t] + m.P_ch_FTM[t]
+        total_dis = m.P_dis_BTM[t] + m.P_dis_FTM[t]
+        return m.D[t] + total_ch == m.P_buy[t] + total_dis + m.P_sell[t]
+    model.Global_Balance = Constraint(model.T, rule=global_balance)
+
+    # 5. Peak Definition (Applies to Grid Buy)
+    def peak_rule(m, t):
+        return m.P_buy[t] <= m.P_peak
+    model.Peak_Def = Constraint(model.T, rule=peak_rule)
+
+    # 6. FCR Constraints
+    # Block rule (4 hours constancy)
+    def fcr_block_rule(m, t):
+        if t == 0 or t % 16 == 0: return Constraint.Skip
+        return m.u_FCR[t] == m.u_FCR[t-1]
+    model.FCR_Block = Constraint(model.T, rule=fcr_block_rule)
+    
+    def fcr_bid_consistency(m, t):
+        if t == 0 or t % 16 == 0: return Constraint.Skip
+        return m.P_FCR_bid[t] == m.P_FCR_bid[t-1]
+    model.FCR_Bid_Block = Constraint(model.T, rule=fcr_bid_consistency)
+
+    # Link Binary to Bid (Variable Capacity Bidding)
+    def fcr_bid_limit(m, t):
+        return m.P_FCR_bid[t] <= m.u_FCR[t] * ftm_p_max
+    model.FCR_Bid_Limit = Constraint(model.T, rule=fcr_bid_limit)
+    
+    # 7. SOH Degradation (Physical Total)
+    def soh_update(m, t):
+        # Sum of absolute currents from both partitions
+        total_p_flow = (m.P_ch_BTM[t] + m.P_dis_BTM[t]) + (m.P_ch_FTM[t] + m.P_dis_FTM[t])
+        # Note: FCR regulation also causes degradation, technically should add |P_FCR_bid * signal|
+        # approximating with just scheduled flow for linearity
+        return m.SOH[t+1] == m.SOH[t] - (a + b*(total_p_flow)/V_bat + c*m.SOH[t])*delta_t*3600
+    model.SOH_Update = Constraint(model.Tstep, rule=soh_update)
+
+    # --- Objective ---
+    def objective_rule(m):
+        # Costs
+        energy_cost = sum((m.C_buy[t] * m.P_buy[t])*delta_t for t in m.T)
+        peak_cost = m.P_peak * C_peak
+        deg_cost = I0 * (SOH0 - m.SOH[T]) / (SOH0 - 0.8)
+        
+        # Revenues
+        energy_revenue = sum((m.C_sell[t] * m.P_sell[t])*delta_t for t in m.T)
+        # FIXED: FCR Revenue Calculation (Price * Bid_Capacity * Time)
+        # Note: C_FCR is usually EUR/MW/hour. If C_FCR input is EUR/kW/hour:
+        fcr_revenue = sum(C_FCR[t] * m.P_FCR_bid[t] * delta_t for t in m.T)
+        
+        return (energy_cost + peak_cost + deg_cost) - (energy_revenue + fcr_revenue)
+        
+    model.Obj = Objective(rule=objective_rule, sense=minimize)
+
+    return model
+
+""" def build_battery_model(T,
                         C_buy, # energy cost
                         C_sell,
                         D, # demand
@@ -351,21 +490,18 @@ def build_battery_model(T,
 
     return model
 
-
-day_ahead = load_day_ahead_prices() #EUR/kWh
-fcr_prices = load_fcr_prices() #EUR/kW
-
-load_df = pd.read_csv(this_file / "Load profile.csv")
-load = load_df["LG 18"]*3
-
+ """
+#laod data and define Parameters
+fcr_prices, day_ahead, load = load_and_process_data(this_file, specific_load='LG 18')
 peak_tarif = 192.66
 
+#Ratio of BTM to FTM capacity
+btm_ratio = 0.4
 N = 7*24*4
 T = len(day_ahead) - 1
 num_steps = T+1
 delta_t = 0.25
 block_size = int(round(4.0 / delta_t))
-
 # Luna 2000-215 data:
 E_2000 = 215
 C_2000 = 108
@@ -380,9 +516,33 @@ FCR_signal = generate_fcr_activation_profile(
         eta_dis=eta_2000,
         seed=42
     )
-
+model_fixed_rates = build_split_battery_model(
+    T=T,
+    C_buy=day_ahead,
+    C_sell=day_ahead,
+    D=load,
+    E_bat_max=E_2000*N_bat,
+    I0=I_2000*N_bat,
+    C_peak=peak_tarif,
+    P_buy_max=100000,
+    P_sell_max=100000,
+    P_ch_max=C_2000*N_bat,
+    P_dis_max=C_2000*N_bat,
+    eta_ch=eta_2000,
+    eta_dis=eta_2000,
+    delta_t=0.25,
+    SOC0=0.5,
+    SOH0=1.0,
+    a=10e-11,
+    b=10e-11,
+    c=10e-10,
+    V_bat = 777,
+    C_FCR=fcr_prices,
+    FCR_signal=FCR_signal,
+    btm_ratio=btm_ratio
+)
 # Battery model, all values in kWh or kW
-model = build_battery_model(
+""" model = build_battery_model(
     T=T,
     C_buy=day_ahead,
     C_sell=day_ahead,
@@ -405,11 +565,13 @@ model = build_battery_model(
     V_bat = 777,
     C_FCR=fcr_prices,
     FCR_signal=FCR_signal
-)
+) """
 
 solver = SolverFactory('gurobi')
-results = solver.solve(model, tee=True)
-model.display()
+results = solver.solve(model_fixed_rates, tee=True)
+model_fixed_rates.display()
 
 # Extract data from model
 
+
+# %%
