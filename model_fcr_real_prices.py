@@ -129,10 +129,15 @@ def plot_results(model):
 
 
 
-def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
+def plot_comprehensive_results(model, delta_t=0.25, E_nom=None, c_peak=None):
     """
     Generates a 4-row Interactive Dashboard for Battery Optimization.
-    Fixed: Variable naming consistency (p_fcr_bid) to prevent UnboundLocalError.
+    
+    Args:
+        model: The solved Pyomo model
+        delta_t: Time step duration (hours)
+        E_nom: Total Nominal Energy Capacity in kWh (Required for SOC %)
+        c_peak: (Optional) Peak Tariff price in EUR/kW. If None, tries to read model.C_peak.
     """
     print("Extracting and processing optimization results...")
     
@@ -143,16 +148,23 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
         if hasattr(model, 'E_bat_max'):
             E_nom = value(model.E_bat_max)
         else:
-            raise ValueError("Error: Please provide E_nom (Total Battery Capacity in kWh) to the function.")
+            raise ValueError("Error: Please provide E_nom (Total Battery Capacity in kWh).")
+
+    # Validation: Peak Tariff Retrieval
+    if c_peak is not None:
+        c_peak_val = c_peak
+    elif hasattr(model, 'C_peak'):
+        try:
+            c_peak_val = value(model.C_peak)
+        except:
+            c_peak_val = 0
+            print("Warning: model.C_peak exists but has no value. Peak Savings will be 0.")
+    else:
+        c_peak_val = 0
+        print("Warning: C_peak not found in model or arguments. Peak Savings will be 0.")
 
     records = []
     is_split = hasattr(model, 'P_ch_BTM')
-    
-    # Get Peak Tariff for annotation (safe retrieval)
-    try:
-        c_peak_val = value(model.C_peak)
-    except:
-        c_peak_val = 0
 
     for t in model.T:
         # A. Basic Market & Grid Data
@@ -167,22 +179,18 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
         
         # B. Battery Flows & Physics
         if is_split:
-            # 1. BTM Partition (Self-Consumption / Peak Shaving)
+            # 1. BTM Partition
             p_btm_ch = value(model.P_ch_BTM[t])
             p_btm_dis = value(model.P_dis_BTM[t])
             p_btm_net = p_btm_ch - p_btm_dis
             
-            # 2. FTM Partition (Arbitrage + FCR)
+            # 2. FTM Partition
             p_ftm_ch = value(model.P_ch_FTM[t])
             p_ftm_dis = value(model.P_dis_FTM[t])
             
-            # --- CRITICAL FIX: Add Physical FCR Flow ---
-            # The model tracks SOC change from FCR, but we must visualize it.
-            # Signal: (+) = Absorb/Charge, (-) = Inject/Discharge
+            # 3. FCR Logic (Signal already includes efficiency)
             sig = value(model.FCR_signal[t])
-            
-            # FIX: Name this 'p_fcr_bid' so it matches the variable used in revenue calc below
-            p_fcr_bid = value(model.P_FCR_bid[t]) 
+            p_fcr_bid = value(model.P_FCR_bid[t]) # Define variable for later use
             
             fcr_physical_flow = p_fcr_bid * sig 
             
@@ -199,33 +207,22 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
             p_btm_net = p_btm_ch - p_btm_dis
             p_ftm_net = 0
             soc_kwh = value(model.SOC[t])
-            p_fcr_bid = 0 # Explicitly defined here
+            p_fcr_bid = 0 # Explicit definition
 
-        # Total Battery Net Flow (for checking balance)
+        # Total Battery Net Flow
         batt_total_net = p_btm_net + p_ftm_net
         
-        # SOC Percentage (Accounting for Degradation)
+        # SOC Percentage
         current_cap_kwh = E_nom * value(model.SOH[t])
         soc_pct = (soc_kwh / current_cap_kwh * 100) if current_cap_kwh > 0 else 0
 
-        # C. Financial Stream Calculations (Per Step)
-        
-        # 1. FCR Revenue (Capacity Payment)
-        # Now 'p_fcr_bid' exists regardless of logic path
+        # C. Financial Stream Calculations
         rev_fcr_t = p_fcr_bid * fcr_price * delta_t
-        
-        # 2. Export Revenue (Selling Energy)
         rev_export_t = p_sell * price * delta_t
+        sav_btm_t = p_btm_dis * price * delta_t # Gross avoided cost
         
-        # 3. BTM Savings (Avoided Cost)
-        # Gross value of energy discharged to cover load
-        sav_btm_t = p_btm_dis * price * delta_t
-        
-        # 4. Net Cashflow (The "Bill")
-        # Cost Base = If we had no battery
+        # Net Cashflow
         cost_base_t = demand * delta_t * price
-        
-        # Cost Opt = Actual Bill (Import Cost - Export Rev - FCR Rev)
         cost_opt_t = (p_buy * delta_t * price) - (p_sell * delta_t * price) - rev_fcr_t
 
         records.append({
@@ -233,6 +230,7 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
             'Price': price, 
             'Demand': demand, 
             'Grid_Net': grid_net,
+            'P_Buy': p_buy, # Stored explicitly for Peak Calculation
             'Batt_Net': batt_total_net, 
             'P_BTM_Net': p_btm_net, 
             'P_FTM_Net': p_ftm_net,
@@ -256,14 +254,27 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
     df['Cum_FCR'] = df['Rev_FCR'].cumsum()
     df['Cum_Export'] = df['Rev_Export'].cumsum()
     df['Cum_BTM'] = df['Sav_BTM'].cumsum()
-    
     df['Cum_Cost_Base'] = df['Cost_Base'].cumsum()
     df['Cum_Cost_Opt'] = df['Cost_Opt'].cumsum()
     
-    # Calculate Lump-Sum Peak Savings
-    max_load = df['Demand'].max()
-    max_import = df['Grid_Net'].max()
-    peak_savings_eur = (max_load - max_import) * c_peak_val
+    # --- PEAK SAVINGS CALCULATION ---
+    # Baseline Peak: Max raw demand (assuming no battery)
+    baseline_peak_kw = df['Demand'].max()
+    
+    # Optimized Peak: Max Grid Import (P_Buy)
+    optimized_peak_kw = df['P_Buy'].max()
+    
+    # Costs
+    cost_peak_old = baseline_peak_kw * c_peak_val
+    cost_peak_new = optimized_peak_kw * c_peak_val
+    peak_savings_eur = cost_peak_old - cost_peak_new
+    
+    print("-" * 40)
+    print(f"PEAK SHAVING REPORT (Price: {c_peak_val:.2f} EUR/kW):")
+    print(f"  Old Peak: {baseline_peak_kw:.2f} kW -> Cost: {cost_peak_old:,.2f} EUR")
+    print(f"  New Peak: {optimized_peak_kw:.2f} kW -> Cost: {cost_peak_new:,.2f} EUR")
+    print(f"  SAVINGS:  {peak_savings_eur:,.2f} EUR")
+    print("-" * 40)
 
     # --- 2. PLOTTING STRATEGY ---
     fig = make_subplots(
@@ -280,120 +291,47 @@ def plot_comprehensive_results(model, delta_t=0.25, E_nom=None):
     )
 
     # --- ROW 1: GRID ---
-    # Grey Area: Original Demand
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Demand'], name='Original Load',
-        fill='tozeroy', line=dict(color='lightgrey', width=0), hoverinfo='skip'
-    ), row=1, col=1)
-    
-    # Black Line: Final Meter Reading
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Grid_Net'], name='Net Grid Profile',
-        line=dict(color='black', width=2),
-        hovertemplate='Grid: %{y:.1f} kW'
-    ), row=1, col=1)
-    
-    # Red Dot Line: Peak Limit
-    fig.add_trace(go.Scatter(
-        x=df.index, y=[df['P_peak'].max()]*len(df), name='Peak Limit',
-        line=dict(color='red', dash='dot', width=1)
-    ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Demand'], name='Original Load',
+                             fill='tozeroy', line=dict(color='lightgrey', width=0), hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Grid_Net'], name='Net Grid Profile',
+                             line=dict(color='black', width=2)), row=1, col=1)
+    # Peak Line (Optimized)
+    fig.add_trace(go.Scatter(x=df.index, y=[optimized_peak_kw]*len(df), name='New Peak Limit',
+                             line=dict(color='red', dash='dot', width=1)), row=1, col=1)
 
-    # --- ROW 2: BATTERY FLOWS ---
-    # BTM (Green/Red)
-    fig.add_trace(go.Bar(
-        x=df.index, y=df['P_BTM_Net'], name='BTM Flow',
-        marker=dict(color=df['P_BTM_Net'].apply(lambda x: '#d62728' if x>=0 else '#2ca02c')),
-        marker_line_width=0,
-        hovertemplate='BTM: %{y:.1f} kW'
-    ), row=2, col=1)
-    
-    # FTM (Orange/Blue)
-    fig.add_trace(go.Bar(
-        x=df.index, y=df['P_FTM_Net'], name='FTM Flow',
-        marker=dict(color=df['P_FTM_Net'].apply(lambda x: '#ff7f0e' if x>=0 else '#1f77b4')),
-        marker_line_width=0,
-        hovertemplate='FTM: %{y:.1f} kW'
-    ), row=2, col=1)
+    # --- ROW 2: BATTERY ---
+    fig.add_trace(go.Bar(x=df.index, y=df['P_BTM_Net'], name='BTM Flow',
+                         marker=dict(color=df['P_BTM_Net'].apply(lambda x: '#d62728' if x>=0 else '#2ca02c')),
+                         marker_line_width=0), row=2, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df['P_FTM_Net'], name='FTM Flow',
+                         marker=dict(color=df['P_FTM_Net'].apply(lambda x: '#ff7f0e' if x>=0 else '#1f77b4')),
+                         marker_line_width=0), row=2, col=1)
 
-    # --- ROW 3: SOC & PRICE ---
-    # SOC % (Green Line)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['SOC_Pct'], name='SOC %',
-        line=dict(color='green', width=2), 
-        hovertemplate='<b>SOC: %{y:.1f}%</b><br>(%{customdata:.1f} kWh)',
-        customdata=df['SOC_kWh']
-    ), row=3, col=1)
-    
-    # Price (Red Line, secondary axis)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Price'], name='Price',
-        line=dict(color='red', width=1), opacity=0.5
-    ), row=3, col=1, secondary_y=True)
+    # --- ROW 3: SOC ---
+    fig.add_trace(go.Scatter(x=df.index, y=df['SOC_Pct'], name='SOC %',
+                             line=dict(color='green', width=2)), row=3, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Price'], name='Price',
+                             line=dict(color='red', width=1), opacity=0.5), row=3, col=1, secondary_y=True)
 
-    # --- ROW 4: REVENUE STACK ---
-    # Stacked Area Chart for Revenue Sources
+    # --- ROW 4: REVENUE ---
+    fig.add_trace(go.Scatter(x=df.index, y=df['Cum_BTM'], name='BTM Savings', stackgroup='one', line=dict(width=0, color='#2ca02c')), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Cum_Export'], name='Export Rev', stackgroup='one', line=dict(width=0, color='#1f77b4')), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df['Cum_FCR'], name='FCR Rev', stackgroup='one', line=dict(width=0, color='#9467bd')), row=4, col=1)
     
-    # 1. BTM Savings (Green)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Cum_BTM'], name='BTM Savings',
-        stackgroup='one', line=dict(width=0, color='#2ca02c'),
-        hovertemplate='%{y:.0f} €'
-    ), row=4, col=1)
-    
-    # 2. Export Revenue (Blue)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Cum_Export'], name='Export Revenue',
-        stackgroup='one', line=dict(width=0, color='#1f77b4'),
-        hovertemplate='%{y:.0f} €'
-    ), row=4, col=1)
-    
-    # 3. FCR Revenue (Purple)
-    fig.add_trace(go.Scatter(
-        x=df.index, y=df['Cum_FCR'], name='FCR Revenue',
-        stackgroup='one', line=dict(width=0, color='#9467bd'),
-        hovertemplate='%{y:.0f} €'
-    ), row=4, col=1)
-
-    # 4. Total Net Profit (Black Dashed Line)
-    # The Gap between the Stacked Area and this line represents Charging Costs
     net_savings = df['Cum_Cost_Base'] - df['Cum_Cost_Opt']
-    fig.add_trace(go.Scatter(
-        x=df.index, y=net_savings, name='Net Profit (Cashflow)',
-        line=dict(color='black', width=2, dash='dot'),
-        hovertemplate='Net: %{y:.0f} €'
-    ), row=4, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=net_savings, name='Net Profit', line=dict(color='black', width=2, dash='dot')), row=4, col=1)
 
-    # --- ANNOTATIONS & LAYOUT ---
-    
-    # Annotation for Peak Savings (Scalar value)
+    # Peak Annotation
     fig.add_annotation(
         xref="paper", yref="y4", x=0.02, y=0.90,
         text=f"<b>Peak Savings:</b> {peak_savings_eur:,.0f} € (Lump Sum)",
         showarrow=False, font=dict(color="red", size=12),
         bgcolor="rgba(255,255,255,0.8)", bordercolor="red"
     )
-    
-    # Annotations for Row 2 (Battery Direction)
-    fig.add_annotation(xref="paper", yref="y2", x=0.01, y=df['Batt_Net'].max(),
-                       text="Pos = CHARGING", showarrow=False, font=dict(color="red", size=10))
-    fig.add_annotation(xref="paper", yref="y2", x=0.01, y=df['Batt_Net'].min(),
-                       text="Neg = DISCHARGING", showarrow=False, font=dict(color="green", size=10))
 
     fig.update_layout(height=1300, template="plotly_white", barmode='relative', hovermode="x unified")
-    
-    # Axis Labels
-    fig.update_yaxes(title_text="Grid Power (kW)", row=1, col=1)
-    fig.update_yaxes(title_text="Battery Power (kW)", row=2, col=1)
-    fig.update_yaxes(title_text="SOC (%)", row=3, col=1, range=[0, 105])
-    fig.update_yaxes(title_text="Price (€)", row=3, col=1, secondary_y=True)
-    fig.update_yaxes(title_text="Cumulative €", row=4, col=1)
-    fig.update_xaxes(rangeslider=dict(visible=True), row=4, col=1)
-
-    print("Saving complete dashboard to 'optimization_dashboard_final.html'...")
-    fig.write_html("optimization_dashboard_final.html")
     fig.show()
-
+    fig.write_html("optimization_dashboard_final.html")
 
     
 #%%
@@ -795,6 +733,10 @@ T = len(day_ahead) - 1
 num_steps = T+1
 delta_t = 0.25
 block_size = int(round(4.0 / delta_t))
+
+#total max power feeding or drawing from grid
+p_buy_max = 500 #kW
+p_sell_max = 500 #kW
 # Luna 2000-215 data:
 E_2000 = 215
 C_2000 = 108
@@ -819,8 +761,8 @@ model_fixed_rates = build_split_battery_model(
     E_bat_max=E_2000*N_bat,
     I0=I_2000*N_bat,
     C_peak=peak_tarif,
-    P_buy_max=100000,
-    P_sell_max=100000,
+    P_buy_max=p_buy_max,
+    P_sell_max=p_sell_max,
     P_ch_max=C_2000*N_bat,
     P_dis_max=C_2000*N_bat,
     eta_ch=eta_2000,
@@ -868,6 +810,6 @@ results = solver.solve(model_fixed_rates, tee=True)
 model_fixed_rates.display()
 
 # Extract data from model
-plot_comprehensive_results(model_fixed_rates, delta_t=0.25, E_nom=E_2000)
+plot_comprehensive_results(model_fixed_rates, delta_t=0.25, E_nom=E_2000, c_peak=peak_tarif)
 
 # %%
