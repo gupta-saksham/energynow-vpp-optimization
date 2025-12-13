@@ -327,17 +327,25 @@ def build_multi_battery_model(
     # Per-site FCR bid contribution
     model.P_FCR_bid = Var(model.S, model.T, within=NonNegativeReals, bounds=ftm_power_bounds)
     
-    # Grid exchange per site
-    def P_buy_bounds(m, s, t):
-        return (0, site_config_map[s].P_buy_max)
-    model.P_buy = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_bounds)
+    # Grid exchange per site (split between BTM and FTM)
+    def P_buy_btm_bounds(m, s, t):
+        return (0, m.P_buy_max[s] * m.btm_ratio[s])
+    model.P_buy_BTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_btm_bounds)
     
-    def P_sell_bounds(m, s, t):
-        return (0, site_config_map[s].P_sell_max)
-    model.P_sell = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_bounds)
+    def P_buy_ftm_bounds(m, s, t):
+        return (0, m.P_buy_max[s] * m.ftm_ratio[s])
+    model.P_buy_FTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_ftm_bounds)
     
-    # Binary for buy/sell exclusivity per site
-    model.u_buy = Var(model.S, model.T, within=Binary)
+    def P_sell_btm_bounds(m, s, t):
+        return (0, 0)
+    model.P_sell_BTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_btm_bounds)
+    
+    def P_sell_ftm_bounds(m, s, t):
+        return (0, m.P_sell_max[s] * m.ftm_ratio[s])
+    model.P_sell_FTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_ftm_bounds)
+    
+    # Binary for FTM buy/sell exclusivity
+    model.u_buy_FTM = Var(model.S, model.T, within=Binary)
     
     # Peak demand per site
     model.P_peak = Var(model.S, within=NonNegativeReals)
@@ -423,27 +431,32 @@ def build_multi_battery_model(
     # CONSTRAINTS - Power Balance (Per Site)
     # ==========================================================================
     
-    def power_balance(m, s, t):
-        total_ch = m.P_ch_BTM[s, t] + m.P_ch_FTM[s, t]
-        total_dis = m.P_dis_BTM[s, t] + m.P_dis_FTM[s, t]
-        return m.D[s, t] + total_ch + m.P_sell[s, t] == m.P_buy[s, t] + total_dis
-    model.Power_Balance = Constraint(model.S, model.T, rule=power_balance)
+    def power_balance_btm(m, s, t):
+        # BTM partition serves local demand and can only buy from grid
+        return m.D[s, t] + m.P_ch_BTM[s, t] == m.P_dis_BTM[s, t] + m.P_buy_BTM[s, t]
+    model.Power_Balance_BTM = Constraint(model.S, model.T, rule=power_balance_btm)
     
-    # Buy/Sell exclusivity
-    def buy_binary(m, s, t):
-        return m.P_buy[s, t] <= m.u_buy[s, t] * m.P_buy_max[s]
-    model.Buy_Binary = Constraint(model.S, model.T, rule=buy_binary)
+    def power_balance_ftm(m, s, t):
+        # FTM partition can import/export to grid
+        return m.P_ch_FTM[s, t] + m.P_sell_FTM[s, t] == m.P_dis_FTM[s, t] + m.P_buy_FTM[s, t]
+    model.Power_Balance_FTM = Constraint(model.S, model.T, rule=power_balance_ftm)
     
-    def sell_binary(m, s, t):
-        return m.P_sell[s, t] <= (1 - m.u_buy[s, t]) * m.P_sell_max[s]
-    model.Sell_Binary = Constraint(model.S, model.T, rule=sell_binary)
+    
+    # FTM Buy/Sell exclusivity
+    def ftm_buy_binary(m, s, t):
+        return m.P_buy_FTM[s, t] <= m.u_buy_FTM[s, t] * m.P_buy_max[s] * m.ftm_ratio[s]
+    model.FTM_Buy_Binary = Constraint(model.S, model.T, rule=ftm_buy_binary)
+    
+    def ftm_sell_binary(m, s, t):
+        return m.P_sell_FTM[s, t] <= (1 - m.u_buy_FTM[s, t]) * m.P_sell_max[s] * m.ftm_ratio[s]
+    model.FTM_Sell_Binary = Constraint(model.S, model.T, rule=ftm_sell_binary)
     
     # ==========================================================================
     # CONSTRAINTS - Peak Tracking
     # ==========================================================================
     
     def peak_rule(m, s, t):
-        return m.P_buy[s, t] <= m.P_peak[s]
+        return m.P_buy_BTM[s, t] + m.P_buy_FTM[s, t] <= m.P_peak[s]
     model.Peak_Def = Constraint(model.S, model.T, rule=peak_rule)
     
     # ==========================================================================
@@ -526,7 +539,8 @@ def build_multi_battery_model(
     def objective_rule(m):
         # Energy costs (per site)
         energy_cost = sum(
-            (m.C_buy[t] * m.P_buy[s, t] - m.C_sell[t] * m.P_sell[s, t]) * m.delta_t
+            (m.C_buy[t] * (m.P_buy_BTM[s, t] + m.P_buy_FTM[s, t]) - 
+             m.C_sell[t] * (m.P_sell_BTM[s, t] + m.P_sell_FTM[s, t])) * m.delta_t
             for s in m.S for t in m.T
         )
         
@@ -572,8 +586,12 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             p_fcr_bid = value(model.P_FCR_bid[s, t])
             
             # Grid exchange
-            p_buy = value(model.P_buy[s, t])
-            p_sell = value(model.P_sell[s, t])
+            p_buy_btm = value(model.P_buy_BTM[s, t])
+            p_sell_btm = value(model.P_sell_BTM[s, t])
+            p_buy_ftm = value(model.P_buy_FTM[s, t])
+            p_sell_ftm = value(model.P_sell_FTM[s, t])
+            p_buy = p_buy_btm + p_buy_ftm
+            p_sell = p_sell_btm + p_sell_ftm
             
             # State
             soc_btm = value(model.SOC_BTM[s, t])
@@ -599,6 +617,10 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'P_ch_FTM': p_ch_ftm,
                 'P_dis_FTM': p_dis_ftm,
                 'P_FCR_bid': p_fcr_bid,
+                'P_buy_BTM': p_buy_btm,
+                'P_sell_BTM': p_sell_btm,
+                'P_buy_FTM': p_buy_ftm,
+                'P_sell_FTM': p_sell_ftm,
                 'P_buy': p_buy,
                 'P_sell': p_sell,
                 'Grid_Net': p_buy - p_sell,
@@ -952,4 +974,3 @@ if __name__ == "__main__":
     print("=" * 60)
 
 # %%
-
