@@ -336,9 +336,6 @@ def build_multi_battery_model(
         return (0, m.P_buy_max[s] * m.ftm_ratio[s])
     model.P_buy_FTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_ftm_bounds)
     
-    def P_sell_btm_bounds(m, s, t):
-        return (0, 0)
-    model.P_sell_BTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_btm_bounds)
     
     def P_sell_ftm_bounds(m, s, t):
         return (0, m.P_sell_max[s] * m.ftm_ratio[s])
@@ -540,7 +537,7 @@ def build_multi_battery_model(
         # Energy costs (per site)
         energy_cost = sum(
             (m.C_buy[t] * (m.P_buy_BTM[s, t] + m.P_buy_FTM[s, t]) - 
-             m.C_sell[t] * (m.P_sell_BTM[s, t] + m.P_sell_FTM[s, t])) * m.delta_t
+             m.C_sell[t] * (m.P_sell_FTM[s, t])) * m.delta_t
             for s in m.S for t in m.T
         )
         
@@ -587,11 +584,10 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             
             # Grid exchange
             p_buy_btm = value(model.P_buy_BTM[s, t])
-            p_sell_btm = value(model.P_sell_BTM[s, t])
             p_buy_ftm = value(model.P_buy_FTM[s, t])
             p_sell_ftm = value(model.P_sell_FTM[s, t])
             p_buy = p_buy_btm + p_buy_ftm
-            p_sell = p_sell_btm + p_sell_ftm
+            p_sell = p_sell_ftm
             
             # State
             soc_btm = value(model.SOC_BTM[s, t])
@@ -618,7 +614,6 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'P_dis_FTM': p_dis_ftm,
                 'P_FCR_bid': p_fcr_bid,
                 'P_buy_BTM': p_buy_btm,
-                'P_sell_BTM': p_sell_btm,
                 'P_buy_FTM': p_buy_ftm,
                 'P_sell_FTM': p_sell_ftm,
                 'P_buy': p_buy,
