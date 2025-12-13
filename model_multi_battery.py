@@ -339,9 +339,9 @@ def build_multi_battery_model(
         return (0, m.P_buy_max[s] * m.ftm_ratio[s])
     model.P_buy_FTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_FTM_bounds)
     
-    def P_sell_ftm_bounds(m, s, t):
-        return (0, m.P_sell_max[s] * m.ftm_ratio[s])
-    model.P_sell_FTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_ftm_bounds)
+    def P_sell_bounds(m, s, t):
+        return (0, site_config_map[s].P_sell_max)
+    model.P_sell = Var(model.S, model.T, within=NonNegativeReals, bounds=P_sell_bounds)
     
     # Binary for buy/sell exclusivity per site
     model.u_buy = Var(model.S, model.T, within=Binary)
@@ -376,7 +376,6 @@ def build_multi_battery_model(
         return m.SOC_BTM[s, 0] == SOC0 * E_max * ratio
     model.Init_SOC_BTM = Constraint(model.S, rule=init_soc_btm)
 
-    
     def end_soc_btm(m, s):
         E_max = site_config_map[s].battery.E_max
         ratio = site_config_map[s].btm_ratio
@@ -568,12 +567,12 @@ def build_multi_battery_model(
         
         # Degradation costs (per site)
         deg_cost = sum(
-            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.6)
+            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.8)
             for s in m.S
         )
         
         # FCR revenue (aggregated - payment is per MW bid)
-        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] for t in m.T)
+        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] * m.delta_t for t in m.T)
         
         return energy_cost + peak_cost + deg_cost - fcr_revenue
     
@@ -632,9 +631,6 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'P_ch_FTM': p_ch_ftm,
                 'P_dis_FTM': p_dis_ftm,
                 'P_FCR_bid': p_fcr_bid,
-                'P_buy_BTM': p_buy_btm,
-                'P_buy_FTM': p_buy_ftm,
-                'P_sell_FTM': p_sell_ftm,
                 'P_buy': p_buy,
                 'P_sell': p_sell,
                 'Grid_Net': p_buy - p_sell,
@@ -988,3 +984,4 @@ if __name__ == "__main__":
     print("=" * 60)
 
 # %%
+
