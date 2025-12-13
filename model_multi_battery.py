@@ -161,6 +161,11 @@ def load_multi_site_data(
         'time_index': day_ahead.index
     }
 
+def load_fcr_activation_profile(data_dir: Path):
+    fcr_profile_df = pd.read_csv(data_dir / "dynamic_frequ_factor_FCR_2024_15min.csv", sep=",")
+    fcr_up = fcr_profile_df["FCR_Power_Factor_Up_Sum"]
+    fcr_down = fcr_profile_df["FCR_Power_Factor_Down_Sum"]
+    return fcr_up, fcr_down
 
 def generate_fcr_activation_profile(num_steps: int, block_size: int, 
                                      eta_ch: float, eta_dis: float, 
@@ -190,7 +195,8 @@ def generate_fcr_activation_profile(num_steps: int, block_size: int,
 def build_multi_battery_model(
     site_configs: List[SiteConfig],
     data: Dict,
-    fcr_signal: np.ndarray,
+    fcr_signal_up: np.ndarray,
+    fcr_signal_down: np.ndarray,
     delta_t: float = 0.25,
     SOC0: float = 0.5,
     SOH0: float = 1.0,
@@ -247,7 +253,9 @@ def build_multi_battery_model(
     model.C_buy = Param(model.T, initialize=lambda m, t: C_buy[t])
     model.C_sell = Param(model.T, initialize=lambda m, t: C_sell[t])
     model.C_FCR = Param(model.T, initialize=lambda m, t: C_FCR[t])
-    model.FCR_signal = Param(model.T, initialize=lambda m, t: fcr_signal[t])
+    model.FCR_signal_up = Param(model.T, initialize=lambda m, t: fcr_signal_up[t])
+    model.FCR_signal_down = Param(model.T, initialize=lambda m, t: fcr_signal_down[t])
+    model.FCR_max_factor = Param(initialize=max(max(fcr_signal_up), max(fcr_signal_down)) * 1.1) # Safety factor of 10 %
     
     # Site-specific parameters
     site_config_map = {cfg.site_id: cfg for cfg in site_configs}
@@ -413,9 +421,9 @@ def build_multi_battery_model(
         eta_ch = m.eta_ch[s]
         eta_dis = m.eta_dis[s]
         # FCR activation affects FTM SOC
-        fcr_flow = m.P_FCR_bid[s, t] * m.FCR_signal[t]
+        fcr_power = m.P_FCR_bid[s, t] * (m.FCR_signal_up[t] - m.FCR_signal_down[t]) * m.P_bat_max[s] / 3600
         return m.SOC_FTM[s, t+1] == m.SOC_FTM[s, t] + \
-               (eta_ch * m.P_ch_FTM[s, t] - (1/eta_dis) * m.P_dis_FTM[s, t] + fcr_flow) * m.delta_t
+               (eta_ch * m.P_ch_FTM[s, t] - (1/eta_dis) * m.P_dis_FTM[s, t] + fcr_power) * m.delta_t
     model.SOC_Balance_FTM = Constraint(model.S, model.Tstep, rule=soc_balance_ftm)
     
     # ==========================================================================
@@ -432,13 +440,12 @@ def build_multi_battery_model(
     
     def max_soc_ftm(m, s, t):
         # Reserve headroom for FCR charging
-        return m.SOC_FTM[s, t] <= (m.E_bat_current[s, t] * m.ftm_ratio[s]) - \
-               (m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s])
+        return m.SOC_FTM[s, t] <= (m.E_bat_current[s, t] * m.ftm_ratio[s]) - (m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s] * m.FCR_max_factor / 3600)
     model.Max_SOC_FTM = Constraint(model.S, model.T, rule=max_soc_ftm)
     
     def min_soc_ftm(m, s, t):
         # Reserve floor for FCR discharging
-        return m.SOC_FTM[s, t] >= m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s])
+        return m.SOC_FTM[s, t] >= m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s]) * m.FCR_max_factor / 3600
     model.Min_SOC_FTM = Constraint(model.S, model.T, rule=min_soc_ftm)
     
     # ==========================================================================
@@ -620,7 +627,7 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             # Aggregated FCR
             fcr_total = value(model.P_FCR_total[t])
             u_fcr = value(model.u_FCR[t])
-            fcr_signal = value(model.FCR_signal[t])
+            fcr_signal = value(model.FCR_signal_up[t]) - value(model.FCR_signal_down[t]) 
             
             records.append({
                 't': t,
@@ -841,13 +848,15 @@ if __name__ == "__main__":
     # Generate FCR activation profile
     delta_t = 0.25
     block_size = int(round(4.0 / delta_t))  # 16 steps = 4 hours
-    fcr_signal = generate_fcr_activation_profile(
-        num_steps=data['num_steps'],
-        block_size=block_size,
-        eta_ch=0.974,
-        eta_dis=0.974,
-        seed=42
-    )
+    #fcr_signal = generate_fcr_activation_profile(
+       # num_steps=data['num_steps'],
+       # block_size=block_size,
+        #eta_ch=0.974,
+       # eta_dis=0.974,
+       # seed=42
+    #)
+
+    fcr_up, fcr_down = load_fcr_activation_profile(data_dir=this_file)
     
     # =========================================================================
     # BUILD AND SOLVE MODEL
@@ -857,7 +866,8 @@ if __name__ == "__main__":
     model = build_multi_battery_model(
         site_configs=site_configs,
         data=data,
-        fcr_signal=fcr_signal,
+        fcr_signal_up=fcr_up,
+        fcr_signal_down=fcr_down,
         delta_t=delta_t,
         SOC0=0.5,
         SOH0=1.0,
