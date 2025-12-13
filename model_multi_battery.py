@@ -105,7 +105,10 @@ def load_multi_site_data(
     
     # Convert EUR/MW to EUR/kW
     fcr_prices_normalized = fcr_prices / 1000.0
-    
+
+    # Normalize to 15min time frames
+    fcr_prices_normalized =  fcr_prices_normalized / 16.0
+
     # --- 3. Load Demand Profiles ---
     load_df = pd.read_csv(data_dir / "Load profile.csv", index_col='Time stamp')
     load_df.index = pd.to_datetime(load_df.index, format='%d/%m/%Y %H:%M')
@@ -343,7 +346,10 @@ def build_multi_battery_model(
     
     # Binary for FTM buy/sell exclusivity
     model.u_buy_FTM = Var(model.S, model.T, within=Binary)
-    
+
+    # Binary for charge/discharge exclusivity per site BTM
+    model.u_chr_BTM = Var(model.S, model.T, within=Binary)
+
     # Peak demand per site
     model.P_peak = Var(model.S, within=NonNegativeReals)
     
@@ -370,12 +376,25 @@ def build_multi_battery_model(
         ratio = site_config_map[s].btm_ratio
         return m.SOC_BTM[s, 0] == SOC0 * E_max * ratio
     model.Init_SOC_BTM = Constraint(model.S, rule=init_soc_btm)
+
+    
+    def end_soc_btm(m, s):
+        E_max = site_config_map[s].battery.E_max
+        ratio = site_config_map[s].btm_ratio
+        return m.SOC_BTM[s, T] == SOC0 * E_max * ratio
+    model.End_SOC_BTM = Constraint(model.S, rule=end_soc_btm)
     
     def init_soc_ftm(m, s):
         E_max = site_config_map[s].battery.E_max
         ratio = 1 - site_config_map[s].btm_ratio
         return m.SOC_FTM[s, 0] == SOC0 * E_max * ratio
     model.Init_SOC_FTM = Constraint(model.S, rule=init_soc_ftm)
+
+    def end_soc_ftm(m, s):
+        E_max = site_config_map[s].battery.E_max
+        ratio = 1 - site_config_map[s].btm_ratio
+        return m.SOC_FTM[s, T] == SOC0 * E_max * ratio
+    model.End_SOC_FTM = Constraint(model.S, rule=end_soc_ftm)
     
     def init_soh(m, s):
         return m.SOH[s, 0] == SOH0
@@ -448,6 +467,15 @@ def build_multi_battery_model(
         return m.P_sell_FTM[s, t] <= (1 - m.u_buy_FTM[s, t]) * m.P_sell_max[s] * m.ftm_ratio[s]
     model.FTM_Sell_Binary = Constraint(model.S, model.T, rule=ftm_sell_binary)
     
+    # Charge/Discharge exclusivity for BTM
+    def chr_BTM_binary(m, s, t):
+        return m.P_ch_BTM[s, t] <= m.u_chr_BTM[s, t] * m.P_bat_max[s] * m.btm_ratio[s]
+    model.Ch_BTM_Binary = Constraint(model.S, model.T, rule=chr_BTM_binary)
+    
+    def dis_BTM_binary(m, s, t):
+        return m.P_dis_BTM[s, t] <= (1 - m.u_chr_BTM[s, t]) * m.P_bat_max[s] * m.btm_ratio[s]
+    model.Dis_BTM_Binary = Constraint(model.S, model.T, rule=dis_BTM_binary)
+
     # ==========================================================================
     # CONSTRAINTS - Peak Tracking
     # ==========================================================================
@@ -546,12 +574,12 @@ def build_multi_battery_model(
         
         # Degradation costs (per site)
         deg_cost = sum(
-            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.8)
+            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.6)
             for s in m.S
         )
         
         # FCR revenue (aggregated - payment is per MW bid)
-        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] * m.delta_t for t in m.T)
+        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] for t in m.T)
         
         return energy_cost + peak_cost + deg_cost - fcr_revenue
     
@@ -802,7 +830,7 @@ if __name__ == "__main__":
     btm_ratio = [0,0.2,0.4,0.6,0.8,1]
     scaler_input = [0.2, 0.5, 1, 1.5, 5]
 
-    
+    C_peak = 192.66 * data_full['T']/(366 * 24 * 60 * 4)
 
     OPTIMIZATION_HORIZON_DAYS = 7  # Set to None for full year
     
