@@ -1,162 +1,151 @@
 import requests
 import pandas as pd
-import numpy as np
 import time
+import numpy as np
 from datetime import date, timedelta
 from pathlib import Path
 
-# ================= CONFIG =================
+# --- KONFIGURATION ---
 YEAR = 2024
 BASE_DIR = Path(__file__).resolve().parent
 FILE_FREQ = BASE_DIR / "frequency_2024_1min.csv"
 FILE_MODEL = BASE_DIR / "FCR_Energy_2024_15min.csv"
 
-DEADBAND = 0.010
-FULL_POWER = 0.200
 
-MAX_RETRIES = 10
-RETRY_SLEEP_BASE = 2.0   # seconds
-# =========================================
+# FCR Parameter
+DEADBAND = 0.010   # 10 mHz
+FULL_POWER = 0.200 # 200 mHz
 
 
-def calculate_fcr_factors(freq):
-    delta_f = freq - 50.0
+def calculate_fcr_factors(freq_series):
+    delta_f = freq_series - 50.0
     slope = FULL_POWER - DEADBAND
 
-    return np.where(
-        delta_f > FULL_POWER, 1.0,
-        np.where(
-            delta_f < -FULL_POWER, -1.0,
-            np.where(
-                np.abs(delta_f) <= DEADBAND, 0.0,
-                np.where(
-                    delta_f > 0,
-                    (delta_f - DEADBAND) / slope,
-                    (delta_f + DEADBAND) / slope
-                )
-            )
-        )
+    conditions = [
+        (delta_f > DEADBAND) & (delta_f < FULL_POWER),
+        (delta_f >= FULL_POWER),
+        (delta_f < -DEADBAND) & (delta_f > -FULL_POWER),
+        (delta_f <= -FULL_POWER),
+        (delta_f.abs() <= DEADBAND)
+    ]
+
+    choices = [
+        (delta_f - DEADBAND) / slope,
+        1.0,
+        (delta_f + DEADBAND) / slope,
+        -1.0,
+        0.0
+    ]
+
+    return pd.Series(
+        np.select(conditions, choices, default=0.0),
+        index=freq_series.index
     )
 
 
-def fetch_day_with_retry(base_url, day):
-    """Fetch one day of data with retry & backoff."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.get(
-                base_url,
-                params={"country": "de", "start": day, "end": day},
-                timeout=30
-            )
-            r.raise_for_status()
-            js = r.json()
+def ensure_output_files_exist():
+    """Create CSV files with headers if they do not exist."""
 
-            if (
-                js.get("data")
-                and js.get("unix_seconds")
-                and len(js["data"]) == len(js["unix_seconds"])
-            ):
-                return js
+    if not FILE_FREQ.exists():
+        pd.DataFrame(
+            columns=["Datum (MEZ)", "Frequenz (Netzfrequenz)"]
+        ).to_csv(FILE_FREQ, index=False)
 
-            raise ValueError("Empty or incomplete payload")
-
-        except Exception as e:
-            wait = RETRY_SLEEP_BASE * attempt
-            print(f"  Retry {attempt}/{MAX_RETRIES} failed: {e} → sleeping {wait:.1f}s")
-            time.sleep(wait)
-
-    raise RuntimeError(f"FAILED after {MAX_RETRIES} retries for {day}")
+    if not FILE_MODEL.exists():
+        pd.DataFrame(
+            columns=[
+                "Time_Slot_Start",
+                "FCR_Power_Factor_Up_Sum",
+                "FCR_Power_Factor_Down_Sum"
+            ]
+        ).to_csv(FILE_MODEL, index=False)
 
 
-def fetch_and_process_all_2024():
+def fetch_and_process_all_2024_final():
     base_url = "https://api.energy-charts.info/frequency"
 
-    # ---------- CREATE OUTPUT FILES ----------
-    pd.DataFrame(
-        columns=["Datum (MEZ)", "Frequenz (Netzfrequenz)"]
-    ).to_csv(FILE_FREQ, index=False)
+    ensure_output_files_exist()
 
-    pd.DataFrame(
-        columns=[
-            "Time_Slot_Start",
-            "FCR_Power_Factor_Up_Sum",
-            "FCR_Power_Factor_Down_Sum"
-        ]
-    ).to_csv(FILE_MODEL, index=False)
+    start_date = date(2024, 1, 1)
+    end_date = date(YEAR, 12, 31)
+    current_date = start_date
 
-    start = date(2024, 1, 1)
-    end = date(2024, 12, 31)
+    print(f"Starte Prozess für {YEAR}...")
 
-    while start <= end:
-        day = start.strftime("%Y-%m-%d")
-        print(f"Processing {day}")
+    while current_date <= end_date:
+        day_str = current_date.strftime("%Y-%m-%d")
+
+        params = {
+            "country": "de",
+            "start": day_str,
+            "end": day_str
+        }
 
         try:
-            js = fetch_day_with_retry(base_url, day)
+            print(f"Verarbeite: {day_str} ...", end="\r")
 
-            # ---------- BASE DATA ----------
+            response = requests.get(base_url, params=params, timeout=30)
+
+            if response.status_code != 200:
+                raise RuntimeError(f"HTTP {response.status_code}")
+
+            json_resp = response.json()
+
+            if 'unix_seconds' not in json_resp or 'data' not in json_resp:
+                raise RuntimeError("Invalid API payload")
+
+            # --- BASIS DATAFRAME ---
             df = pd.DataFrame({
-                "timestamp": pd.to_datetime(
-                    js["unix_seconds"], unit="s", utc=True
-                ).tz_convert("Europe/Berlin"),
-                "frequency": js["data"]
-            }).set_index("timestamp")
+                'timestamp': pd.to_datetime(
+                    json_resp['unix_seconds'], unit='s', utc=True
+                ).tz_convert('Europe/Berlin'),
+                'frequency': json_resp['data']
+            }).set_index('timestamp')
 
-            # ---------- FORCE FULL DAY GRID ----------
-            full_index = pd.date_range(
-                start=pd.Timestamp(day, tz="Europe/Berlin"),
-                end=pd.Timestamp(day, tz="Europe/Berlin") + pd.Timedelta(days=1) - pd.Timedelta(minutes=1),
-                freq="1min"
-            )
+            # --- TEIL 1: FREQUENZ (Minutenwerte) ---
+            df_freq_1min = df[['frequency']].resample('1min').mean()
 
-            freq_1min = (
-                df["frequency"]
-                .resample("1min")
-                .mean()
-                .reindex(full_index)
-                .interpolate("time")
-            )
+            # ---------- COMPLETENESS CHECK ----------
+            if len(df_freq_1min) != 1440:
+                raise ValueError(
+                    f"Incomplete minute data: {len(df_freq_1min)} / 1440"
+                )
 
-            # ---------- HARD VALIDATION ----------
-            if len(freq_1min) != 1440:
-                raise ValueError(f"Expected 1440 minutes, got {len(freq_1min)}")
+            save_freq = pd.DataFrame()
+            save_freq["Datum (MEZ)"] = df_freq_1min.index.map(lambda x: x.isoformat())
+            save_freq["Frequenz (Netzfrequenz)"] = df_freq_1min["frequency"].round(4).values
 
-            # ---------- WRITE FREQUENCY ----------
-            pd.DataFrame({
-                "Datum (MEZ)": freq_1min.index.astype(str),
-                "Frequenz (Netzfrequenz)": freq_1min.round(4)
-            }).to_csv(FILE_FREQ, mode="a", header=False, index=False)
+            save_freq.to_csv(FILE_FREQ, mode="a", header=False, index=False)
 
-            # ---------- FCR MODEL ----------
-            p = calculate_fcr_factors(freq_1min.values)
-            model_15 = pd.DataFrame(
-                {
-                    "p_up": np.clip(p, 0, None),
-                    "p_down": np.clip(-p, 0, None)
-                },
-                index=freq_1min.index
-            ).resample("15min").sum()
+            # --- TEIL 2: MODELL (15 Min Summen) ---
+            df["p_factor"] = calculate_fcr_factors(df["frequency"])
+            df["p_up"] = df["p_factor"].apply(lambda x: x if x > 0 else 0)
+            df["p_down"] = df["p_factor"].apply(lambda x: abs(x) if x < 0 else 0)
 
-            if len(model_15) != 96:
-                raise ValueError(f"Expected 96 slots, got {len(model_15)}")
+            df_model_15min = df[["p_up", "p_down"]].resample("15min").sum()
 
-            pd.DataFrame({
-                "Time_Slot_Start": model_15.index.astype(str),
-                "FCR_Power_Factor_Up_Sum": model_15["p_up"].round(4),
-                "FCR_Power_Factor_Down_Sum": model_15["p_down"].round(4)
-            }).to_csv(FILE_MODEL, mode="a", header=False, index=False)
+            if len(df_model_15min) != 96:
+                raise ValueError(
+                    f"Incomplete 15-min data: {len(df_model_15min)} / 96"
+                )
 
-            print("  OK")
+            save_model = pd.DataFrame()
+            save_model["Time_Slot_Start"] = df_model_15min.index.map(lambda x: x.isoformat())
+            save_model["FCR_Power_Factor_Up_Sum"] = df_model_15min["p_up"].round(4).values
+            save_model["FCR_Power_Factor_Down_Sum"] = df_model_15min["p_down"].round(4).values
 
-            start += timedelta(days=1)
-            time.sleep(0.5)
+            save_model.to_csv(FILE_MODEL, mode="a", header=False, index=False)
+
+            print(f"✔ {day_str} OK")
 
         except Exception as e:
-            print(f"  DAY FAILED → will retry later: {e}")
-            time.sleep(5)
+            print(f"\n❌ Fehler bei {day_str}: {e}")
 
-    print("\nFinished successfully.")
+        current_date += timedelta(days=1)
+        time.sleep(0.3)
+
+    print("\nFertig! Bitte prüfen Sie jetzt die CSV Dateien.")
 
 
 if __name__ == "__main__":
-    fetch_and_process_all_2024()
+    fetch_and_process_all_2024_final()

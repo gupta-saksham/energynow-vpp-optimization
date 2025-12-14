@@ -471,11 +471,11 @@ def build_multi_battery_model(
 
     # Charge/Discharge exclusivity
     def ch_binary_BTM(m, s, t):
-        return m.P_ch_BTM[s, t] <= m.u_ch_BTM[s, t] * m.P_bat_max[s]
+        return m.P_ch_BTM[s, t] <= m.u_ch_BTM[s, t] * m.P_bat_max[s] * m.btm_ratio[s]
     model.Ch_Binary_BTM = Constraint(model.S, model.T, rule=ch_binary_BTM)
     
     def dis_binary_BTM(m, s, t):
-        return m.P_dis_BTM[s, t] <= (1 - m.u_ch_BTM[s, t]) * m.P_bat_max[s]
+        return m.P_dis_BTM[s, t] <= (1 - m.u_ch_BTM[s, t]) * m.P_bat_max[s] * m.btm_ratio[s]
     model.Dis_Binary_FTM = Constraint(model.S, model.T, rule=dis_binary_BTM)
     
     # ==========================================================================
@@ -713,12 +713,12 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         
         # FCR revenue (allocated proportionally)
         site_fcr_frac = site_df['P_FCR_bid'].sum() / max(df['FCR_total'].sum(), 1e-6)
-        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid'] * delta_t).sum()
-        
+        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
+
         # Degradation cost
         soh_start = site_df['SOH'].iloc[0]
         soh_end = site_df['SOH'].iloc[-1]
-        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - 0.8)
+        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - 0.6)
         
         financials['sites'][site_id] = {
             'energy_cost': net_energy,
