@@ -738,7 +738,7 @@ def build_multi_battery_model(
         
         # Degradation costs (per site)
         deg_cost = sum(
-            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.8)
+            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.6)
             for s in m.S
         )
         
@@ -864,44 +864,54 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         site_df = df[df['site'] == site_id].copy()
         cfg = site_config_map[site_id]
         
-        # Energy costs
-        energy_cost = ((site_df['P_buy_BTM'] * site_df['Price industrial'] + site_df['P_buy_FTM'] * site_df['Price'])* delta_t).sum()
-        energy_revenue = (site_df['P_sell'] * site_df['Price'] * delta_t).sum()
-        net_energy = energy_cost - energy_revenue
+        # --- 1. Baseline Cost (No battery/optimization) ---
+        baseline_energy_cost = (site_df['demand'] * site_df['Price industrial'] * delta_t).sum()
+        baseline_peak_cost = site_df['demand'].max() * C_peak
+        baseline_total_cost = baseline_energy_cost + baseline_peak_cost
         
-        # Peak cost
-        peak_kw = site_df['P_peak'].iloc[0]
-        peak_cost = peak_kw * C_peak
-        
-        # Baseline (no battery)
-        baseline_energy = (site_df['demand'] * site_df['Price industrial'] * delta_t).sum()
-        baseline_peak = site_df['demand'].max() * C_peak
-        
-        # BTM savings
-        btm_savings = baseline_energy - net_energy
-        peak_savings = baseline_peak - peak_cost
-        
-        # FCR revenue (allocated proportionally)
-        site_fcr_frac = site_df['P_FCR_bid'].sum() / max(df['FCR_total'].sum(), 1e-6)
-        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
+        # --- 2. Optimized Costs/Revenues from the Grid (Net Energy Cost) ---
 
-        # Degradation cost
+        cost_btm_purchase = (site_df['P_buy_BTM'] * site_df['Price industrial'] * delta_t).sum()
+        cost_ftm_purchase = (site_df['P_buy_FTM'] * site_df['Price'] * delta_t).sum()
+        revenue_ftm_sell = (site_df['P_sell'] * site_df['Price'] * delta_t).sum()
+        
+        # Net Energy Cost (Total spend on energy): 
+        net_energy_cost = cost_btm_purchase + cost_ftm_purchase - revenue_ftm_sell
+
+        # --- 3. Derived Savings/Revenues (Value Stacks) ---
+        load_shifting_savings = baseline_energy_cost - cost_btm_purchase
+        
+        peak_kw_new = site_df['P_peak'].iloc[0]
+        peak_cost_new = peak_kw_new * C_peak
+        peak_shaving_savings = baseline_peak_cost - peak_cost_new
+        
+        day_ahead_arbitrage = revenue_ftm_sell - cost_ftm_purchase
+
+        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
+        
+        # E. Degradation Cost
+        SOH_EOL = 0.8
         soh_start = site_df['SOH'].iloc[0]
         soh_end = site_df['SOH'].iloc[-1]
-        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - 0.6)
+        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - SOH_EOL)
+        
+        # --- 4. Final Net Benefit Check ---
+        # Net Benefit = Sum of all Savings/Revenues - Costs (Degradation)
+        net_benefit = load_shifting_savings + peak_shaving_savings + day_ahead_arbitrage + fcr_revenue - deg_cost
         
         financials['sites'][site_id] = {
-            'energy_cost': net_energy,
-            'peak_cost': peak_cost,
-            'baseline_energy': baseline_energy,
-            'baseline_peak': baseline_peak,
-            'btm_savings': btm_savings,
-            'peak_savings': peak_savings,
+            'energy_cost': net_energy_cost,
+            'peak_cost': peak_cost_new,
+            'baseline_energy': baseline_energy_cost,
+            'baseline_peak': baseline_peak_cost,
+            'btm_savings': load_shifting_savings,
+            'peak_savings': peak_shaving_savings,
+            'day_ahead_arbitrage': day_ahead_arbitrage,
             'fcr_revenue': fcr_revenue,
             'degradation_cost': deg_cost,
-            'net_benefit': btm_savings + peak_savings + fcr_revenue - deg_cost,
+            'net_benefit': net_benefit,
             'peak_kw_old': site_df['demand'].max(),
-            'peak_kw_new': peak_kw,
+            'peak_kw_new': peak_kw_new,
         }
     
     # Portfolio totals
@@ -1005,7 +1015,7 @@ if __name__ == "__main__":
         start_date=START_DATE,
         end_date=END_DATE
     )
-    print([name for name in data])
+
     # Prorate peak tariff based on simulation period
     # (Peak charges are typically annual, so we scale for shorter periods)
     simulation_days = data['num_steps'] / 96  # 96 steps per day
@@ -1138,8 +1148,9 @@ if __name__ == "__main__":
     port = financials['portfolio']
     print(f"Total Baseline Cost:   €{port['baseline_energy'] + port['baseline_peak']:,.2f}")
     print(f"Total Optimized Cost:  €{port['energy_cost'] + port['peak_cost']:,.2f}")
-    print(f"BTM Savings:           €{port['btm_savings']:,.2f}")
+    print(f"Load shifting Savings: €{port['btm_savings']:,.2f}")
     print(f"Peak Savings:          €{port['peak_savings']:,.2f}")
+    print(f"Day ahead arbitrage:   €{port['day_ahead_arbitrage']:,.2f}")
     print(f"FCR Revenue:           €{port['fcr_revenue']:,.2f}")
     print(f"Degradation Cost:      €{port['degradation_cost']:,.2f}")
     print(f"NET BENEFIT:           €{port['net_benefit']:,.2f}")
