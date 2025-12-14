@@ -162,7 +162,7 @@ def load_multi_site_data(
     }
 
 def load_fcr_activation_profile(data_dir: Path):
-    fcr_profile_df = pd.read_csv(data_dir / "FCR_Energy_2024_15min.csv", sep=",")
+    fcr_profile_df = pd.read_csv(data_dir / "FCR_Energy_2024_15min_full.csv", sep=",")
     fcr_up = fcr_profile_df["FCR_Power_Factor_Up_Sum"]
     fcr_down = fcr_profile_df["FCR_Power_Factor_Down_Sum"]
     return fcr_up, fcr_down
@@ -825,7 +825,7 @@ if __name__ == "__main__":
     scaler_input = [0.2, 0.5, 1, 1.5, 5]
 
     C_peak = 192.66
-
+    
     OPTIMIZATION_HORIZON_DAYS = 28  # Set to None for full year
     
     if OPTIMIZATION_HORIZON_DAYS is not None:
