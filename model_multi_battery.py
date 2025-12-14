@@ -109,6 +109,7 @@ def filter_data_by_date_range(
     # Filter all data arrays
     filtered_data = {
         'day_ahead': data['day_ahead'][start_idx:end_idx],
+        'industrial_tarifs': data['industrial_tarifs'][start_idx:end_idx],
         'fcr_prices': data['fcr_prices'][start_idx:end_idx],
         'site_loads': {k: v[start_idx:end_idx] for k, v in data['site_loads'].items()},
         'scale_factors': data['scale_factors'],
@@ -175,6 +176,13 @@ def load_multi_site_data(
     
     # Convert EUR/MWh to EUR/kWh
     day_ahead = day_ahead_df["Germany/Luxembourg [Eur/MWh]"] / 1000.0
+
+    # Load industrial tarifs
+    industrial_tarifs_df = pd.read_csv(data_dir / "industrial_tarrifs.csv")
+    industrial_tarifs_averages = industrial_tarifs_df.iloc[:,2:].mean()
+    tarifs_15min = industrial_tarifs_averages.loc[industrial_tarifs_averages.index.repeat(4)].reset_index(drop=True)
+    tarifs_year = pd.concat([tarifs_15min] * 366, ignore_index=True)
+    tarifs_year = tarifs_year / 1000 # Convert EUR/MWh to EUR/kWh
     
     # --- 2. Load FCR Prices (4-hour blocks) ---
     fcr_df = pd.read_csv(data_dir / "FCR prices 2024.csv", sep=";", decimal=",")
@@ -243,6 +251,7 @@ def load_multi_site_data(
     
     full_data = {
         'day_ahead': day_ahead.values,
+        'industrial_tarifs': tarifs_year.values,
         'fcr_prices': fcr_prices_normalized.values,
         'site_loads': site_loads,
         'scale_factors': scale_factors,
@@ -361,7 +370,8 @@ def build_multi_battery_model(
     model = ConcreteModel(name="Multi-Battery VPP")
     
     T = data['T']
-    C_buy = data['day_ahead']
+    C_buy_BTM = data['industrial_tarifs']
+    C_buy_FTM = data['day_ahead']
     C_sell = data['day_ahead']  # Symmetric pricing
     C_FCR = data['fcr_prices']
     site_loads = data['site_loads']
@@ -391,7 +401,8 @@ def build_multi_battery_model(
     model.C_peak = Param(initialize=C_peak)
     
     # Market prices (time-indexed)
-    model.C_buy = Param(model.T, initialize=lambda m, t: C_buy[t])
+    model.C_buy_BTM = Param(model.T, initialize=lambda m, t: C_buy_BTM[t])
+    model.C_buy_FTM = Param(model.T, initialize=lambda m, t: C_buy_FTM[t])
     model.C_sell = Param(model.T, initialize=lambda m, t: C_sell[t])
     model.C_FCR = Param(model.T, initialize=lambda m, t: C_FCR[t])
     model.FCR_signal_up = Param(model.T, initialize=lambda m, t: fcr_signal_up[t])
@@ -718,7 +729,7 @@ def build_multi_battery_model(
     def objective_rule(m):
         # Energy costs (per site)
         energy_cost = sum(
-            (m.C_buy[t] *( m.P_buy_FTM[s, t] + m.P_buy_BTM[s, t]) - m.C_sell[t] * m.P_sell[s, t]) * m.delta_t
+            (m.C_buy_FTM[t] * m.P_buy_FTM[s, t] + m.C_buy_BTM[t] * m.P_buy_BTM[s, t] - m.C_sell[t] * m.P_sell[s, t]) * m.delta_t
             for s in m.S for t in m.T
         )
         
@@ -765,6 +776,8 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             
             # Grid exchange
             p_buy = value(model.P_buy_FTM[s, t]) + value(model.P_buy_BTM[s, t])
+            p_buy_btm = value(model.P_buy_BTM[s, t])
+            p_buy_ftm = value(model.P_buy_FTM[s, t])
             p_sell = value(model.P_sell[s, t])
             
             # State
@@ -773,7 +786,8 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             soh = value(model.SOH[s, t])
             
             # Market data
-            price = value(model.C_buy[t])
+            price = value(model.C_buy_FTM[t])
+            industrial_price = value(model.C_buy_BTM[t])
             fcr_price = value(model.C_FCR[t])
             demand = value(model.D[s, t])
             
@@ -792,6 +806,8 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'P_dis_FTM': p_dis_ftm,
                 'P_FCR_bid': p_fcr_bid,
                 'P_buy': p_buy,
+                'P_buy_BTM': p_buy_btm,
+                'P_buy_FTM': p_buy_ftm,
                 'P_sell': p_sell,
                 'Grid_Net': p_buy - p_sell,
                 'SOC_BTM': soc_btm,
@@ -799,6 +815,7 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'SOC_total': soc_btm + soc_ftm,
                 'SOH': soh,
                 'Price': price,
+                'Price industrial':industrial_price,
                 'FCR_price': fcr_price,
                 'FCR_total': fcr_total,
                 'u_FCR': u_fcr,
@@ -848,7 +865,7 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         cfg = site_config_map[site_id]
         
         # Energy costs
-        energy_cost = (site_df['P_buy'] * site_df['Price'] * delta_t).sum()
+        energy_cost = ((site_df['P_buy_BTM'] * site_df['Price industrial'] + site_df['P_buy_FTM'] * site_df['Price'])* delta_t).sum()
         energy_revenue = (site_df['P_sell'] * site_df['Price'] * delta_t).sum()
         net_energy = energy_cost - energy_revenue
         
@@ -857,7 +874,7 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         peak_cost = peak_kw * C_peak
         
         # Baseline (no battery)
-        baseline_energy = (site_df['demand'] * site_df['Price'] * delta_t).sum()
+        baseline_energy = (site_df['demand'] * site_df['Price industrial'] * delta_t).sum()
         baseline_peak = site_df['demand'].max() * C_peak
         
         # BTM savings
@@ -988,7 +1005,7 @@ if __name__ == "__main__":
         start_date=START_DATE,
         end_date=END_DATE
     )
-    
+    print([name for name in data])
     # Prorate peak tariff based on simulation period
     # (Peak charges are typically annual, so we scale for shorter periods)
     simulation_days = data['num_steps'] / 96  # 96 steps per day
