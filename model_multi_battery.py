@@ -350,7 +350,7 @@ def build_multi_battery_model(
     delta_t: float = 0.25,
     SOC0: float = 0.5,
     SOH0: float = 1.0,
-    C_peak: float = 192.66,     # EUR/kW peak tariff
+    C_peak: float = 192.66 / 1000,     # EUR/kW peak tariff
     min_fcr_bid: float = 1000.0, # 1 MW minimum FCR bid
     # SOH degradation parameters (small values for linear approximation)
     a: float = 1e-11,
@@ -1001,7 +1001,7 @@ if __name__ == "__main__":
     END_DATE = "2024-01-07"     # End date - 1 week test
     
     # Peak tariff (EUR/kW/year) - will be prorated for simulation period
-    C_peak_annual = 192.66
+    C_peak_annual = 192.66 / 1000
     
     # =========================================================================
     # LOAD DATA WITH DATE RANGE
