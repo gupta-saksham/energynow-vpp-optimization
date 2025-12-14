@@ -971,7 +971,7 @@ if __name__ == "__main__":
     #   END_DATE = None              # To end of data (full year)
     
     START_DATE = "2024-01-01"   # Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
-    END_DATE = "2024-01-07"     # End date - 1 week test
+    END_DATE = "2024-12-31"     # End date - 1 week test
     
     # Peak tariff (EUR/kW/year) - will be prorated for simulation period
     C_peak_annual = 192.66
@@ -1220,6 +1220,33 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("OPTIMIZATION COMPLETE")
     print("=" * 60)
+    
+    # === SAVE PORTFOLIO KPIS ===
+    import json
+    
+    # Create filename-safe date strings (e.g. "2024-01-01" instead of "2024-01-01 00:00")
+    safe_start = START_DATE.replace(":", "").replace(" ", "_")
+    safe_end = END_DATE.replace(":", "").replace(" ", "_")
+    
+    # Define the output filename based on the scenario and date range
+    scenario_name = f"Scenario_BTM_{site_configs[0].btm_ratio}_{safe_start}_to_{safe_end}"
+    kpi_file = this_file / f"KPIs_{scenario_name}.json"
+    
+    # Prepare the data dictionary
+    kpi_data = {
+        "scenario": scenario_name,
+        "btm_ratio": site_configs[0].btm_ratio,
+        "start_date": START_DATE,
+        "end_date": END_DATE,
+        "total_sites": len(site_configs),
+        "results": financials['portfolio']
+    }
+    
+    # Save to JSON
+    with open(kpi_file, "w") as f:
+        json.dump(kpi_data, f, indent=4)
+        
+    print(f"\nSaved portfolio KPIs to: {kpi_file}")
 
 # %%
 
