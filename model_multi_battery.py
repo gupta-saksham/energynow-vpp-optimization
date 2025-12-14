@@ -56,11 +56,84 @@ LUNA_2000_215 = BatterySpec(
 # DATA LOADING
 # =============================================================================
 
+def filter_data_by_date_range(
+    data: Dict,
+    start_date: str = None,
+    end_date: str = None
+) -> Dict:
+    """
+    Filter loaded data to a specific date range.
+    
+    Args:
+        data: Dictionary from load_multi_site_data()
+        start_date: Start date string (e.g., "2024-01-15" or "2024-01-15 00:00")
+        end_date: End date string (e.g., "2024-02-15" or "2024-02-15 23:45")
+    
+    Returns:
+        Filtered data dictionary with updated indices
+    """
+    time_index = data['time_index']
+    
+    # Ensure time_index is timezone-naive for consistent comparison
+    if hasattr(time_index, 'tz') and time_index.tz is not None:
+        time_index = time_index.tz_localize(None)
+    
+    # Parse dates (timezone-naive)
+    if start_date is not None:
+        start_dt = pd.to_datetime(start_date)
+        # Remove timezone if present
+        if hasattr(start_dt, 'tz') and start_dt.tz is not None:
+            start_dt = start_dt.tz_localize(None)
+    else:
+        start_dt = time_index[0]
+    
+    if end_date is not None:
+        end_dt = pd.to_datetime(end_date)
+        # Remove timezone if present
+        if hasattr(end_dt, 'tz') and end_dt.tz is not None:
+            end_dt = end_dt.tz_localize(None)
+    else:
+        end_dt = time_index[-1]
+    
+    # Create mask for the date range
+    mask = (time_index >= start_dt) & (time_index <= end_dt)
+    indices = np.where(mask)[0]
+    
+    if len(indices) == 0:
+        raise ValueError(f"No data found in range {start_dt} to {end_dt}. "
+                        f"Available range: {time_index[0]} to {time_index[-1]}")
+    
+    start_idx = indices[0]
+    end_idx = indices[-1] + 1  # +1 for slicing
+    
+    # Filter all data arrays
+    filtered_data = {
+        'day_ahead': data['day_ahead'][start_idx:end_idx],
+        'fcr_prices': data['fcr_prices'][start_idx:end_idx],
+        'site_loads': {k: v[start_idx:end_idx] for k, v in data['site_loads'].items()},
+        'scale_factors': data['scale_factors'],
+        'T': end_idx - start_idx - 1,
+        'num_steps': end_idx - start_idx,
+        'time_index': time_index[start_idx:end_idx],
+        'start_date': start_dt,
+        'end_date': end_dt
+    }
+    
+    print(f"\n📅 Date Range Filter Applied:")
+    print(f"   From: {filtered_data['time_index'][0]}")
+    print(f"   To:   {filtered_data['time_index'][-1]}")
+    print(f"   Timesteps: {filtered_data['num_steps']} ({filtered_data['num_steps'] / 96:.1f} days)")
+    
+    return filtered_data
+
+
 def load_multi_site_data(
     data_dir: Path,
     site_configs: List[SiteConfig],
     scale_loads_to_battery: bool = True,
-    scaler_input: float = 1.0
+    scaler_input: float = 1.0,
+    start_date: str = None,
+    end_date: str = None
 ) -> Dict:
     """
     Load and process data for multiple sites.
@@ -69,9 +142,26 @@ def load_multi_site_data(
         data_dir: Directory containing data files
         site_configs: List of SiteConfig for each site
         scale_loads_to_battery: If True, scale each load profile to match battery power
+        scaler_input: Additional scaling factor for loads
+        start_date: Optional start date (e.g., "2024-03-01" or "2024-03-01 08:00")
+        end_date: Optional end date (e.g., "2024-03-31" or "2024-03-31 23:45")
         
     Returns:
         Dictionary with processed data arrays
+        
+    Examples:
+        # Load full year
+        data = load_multi_site_data(data_dir, configs)
+        
+        # Load specific month
+        data = load_multi_site_data(data_dir, configs, 
+                                    start_date="2024-06-01", 
+                                    end_date="2024-06-30")
+        
+        # Load specific week
+        data = load_multi_site_data(data_dir, configs,
+                                    start_date="2024-07-15",
+                                    end_date="2024-07-21")
     """
     print("=== Loading Multi-Site Data ===")
     
@@ -151,7 +241,7 @@ def load_multi_site_data(
     print(f"Total timesteps: {num_steps}")
     print(f"Number of sites: {len(site_configs)}")
     
-    return {
+    full_data = {
         'day_ahead': day_ahead.values,
         'fcr_prices': fcr_prices_normalized.values,
         'site_loads': site_loads,
@@ -160,11 +250,62 @@ def load_multi_site_data(
         'num_steps': num_steps,
         'time_index': day_ahead.index
     }
+    
+    # Apply date range filter if specified
+    if start_date is not None or end_date is not None:
+        return filter_data_by_date_range(full_data, start_date, end_date)
+    
+    return full_data
 
-def load_fcr_activation_profile(data_dir: Path):
-    fcr_profile_df = pd.read_csv(data_dir / "FCR_Energy_2024_15min_full.csv", sep=",")
-    fcr_up = fcr_profile_df["FCR_Power_Factor_Up_Sum"]
-    fcr_down = fcr_profile_df["FCR_Power_Factor_Down_Sum"]
+def load_fcr_activation_profile(
+    data_dir: Path,
+    start_date: str = None,
+    end_date: str = None
+):
+    """
+    Load FCR activation profile from CSV file.
+    
+    Args:
+        data_dir: Directory containing FCR_Energy_2024_15min.csv
+        start_date: Optional start date for filtering
+        end_date: Optional end date for filtering
+        
+    Returns:
+        Tuple of (fcr_up, fcr_down) arrays
+    """
+    # Try both possible filenames
+    fcr_file = data_dir / "FCR_Energy_2024_15min.csv"
+    if not fcr_file.exists():
+        fcr_file = data_dir / "FCR_Energy_2024_15min_full.csv"
+    
+    fcr_profile_df = pd.read_csv(fcr_file, sep=",")
+    
+    # Parse timestamps and remove timezone info for consistency
+    fcr_profile_df['Time_Slot_Start'] = pd.to_datetime(fcr_profile_df['Time_Slot_Start'], utc=True)
+    # Convert to timezone-naive (remove timezone info) for easier comparison
+    fcr_profile_df['Time_Slot_Start'] = fcr_profile_df['Time_Slot_Start'].dt.tz_localize(None)
+    fcr_profile_df.set_index('Time_Slot_Start', inplace=True)
+    
+    # Apply date range filter if specified
+    if start_date is not None or end_date is not None:
+        start_dt = pd.to_datetime(start_date) if start_date else fcr_profile_df.index[0]
+        end_dt = pd.to_datetime(end_date) if end_date else fcr_profile_df.index[-1]
+        
+        # Ensure comparison timestamps are also timezone-naive
+        if hasattr(start_dt, 'tz') and start_dt.tz is not None:
+            start_dt = start_dt.tz_localize(None)
+        if hasattr(end_dt, 'tz') and end_dt.tz is not None:
+            end_dt = end_dt.tz_localize(None)
+        
+        mask = (fcr_profile_df.index >= start_dt) & (fcr_profile_df.index <= end_dt)
+        fcr_profile_df = fcr_profile_df[mask]
+        
+        if len(fcr_profile_df) == 0:
+            raise ValueError(f"No FCR data found in range {start_dt} to {end_dt}")
+    
+    fcr_up = fcr_profile_df["FCR_Power_Factor_Up_Sum"].values
+    fcr_down = fcr_profile_df["FCR_Power_Factor_Down_Sum"].values
+    
     return fcr_up, fcr_down
 
 def generate_fcr_activation_profile(num_steps: int, block_size: int, 
@@ -421,9 +562,14 @@ def build_multi_battery_model(
         eta_ch = m.eta_ch[s]
         eta_dis = m.eta_dis[s]
         # FCR activation affects FTM SOC
-        fcr_power = m.P_FCR_bid[s, t] * (m.FCR_signal_up[t] - m.FCR_signal_down[t]) * m.P_bat_max[s] / 3600
+        # FCR_signal is sum of per-second activation factors over 15 min (range ~0-100)
+        # To get effective power: P_FCR_bid * (signal / 900) = average power during slot
+        # Positive signal (up) = battery charges (absorbs power)
+        # Negative signal (down) = battery discharges (injects power)
+        fcr_activation_fraction = (m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 900.0
+        fcr_avg_power = m.P_FCR_bid[s, t] * fcr_activation_fraction  # kW (can be negative)
         return m.SOC_FTM[s, t+1] == m.SOC_FTM[s, t] + \
-               (eta_ch * m.P_ch_FTM[s, t] - (1/eta_dis) * m.P_dis_FTM[s, t] + fcr_power) * m.delta_t
+               (eta_ch * m.P_ch_FTM[s, t] - (1/eta_dis) * m.P_dis_FTM[s, t] + fcr_avg_power) * m.delta_t
     model.SOC_Balance_FTM = Constraint(model.S, model.Tstep, rule=soc_balance_ftm)
     
     # ==========================================================================
@@ -440,12 +586,21 @@ def build_multi_battery_model(
     
     def max_soc_ftm(m, s, t):
         # Reserve headroom for FCR charging
-        return m.SOC_FTM[s, t] <= (m.E_bat_current[s, t] * m.ftm_ratio[s]) - (m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s] * m.FCR_max_factor / 3600)
+        # Worst case: full upward activation for entire 15-min slot
+        # Energy reserved = P_FCR_bid (kW) * delta_t (h) * eta_ch = kWh
+        # FCR_max_factor normalizes: actual activation seconds / 900 seconds per 15min
+        # So we divide by 900 to convert sum-of-seconds back to fraction
+        fcr_headroom = m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s] * (m.FCR_max_factor / 900.0)
+        return m.SOC_FTM[s, t] <= (m.E_bat_current[s, t] * m.ftm_ratio[s]) - fcr_headroom
     model.Max_SOC_FTM = Constraint(model.S, model.T, rule=max_soc_ftm)
     
     def min_soc_ftm(m, s, t):
         # Reserve floor for FCR discharging
-        return m.SOC_FTM[s, t] >= m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s]) * m.FCR_max_factor / 3600
+        # Worst case: full downward activation for entire 15-min slot
+        # Energy reserved = P_FCR_bid (kW) * delta_t (h) / eta_dis = kWh
+        # FCR_max_factor normalizes: actual activation seconds / 900 seconds per 15min
+        fcr_floor = m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s]) * (m.FCR_max_factor / 900.0)
+        return m.SOC_FTM[s, t] >= fcr_floor
     model.Min_SOC_FTM = Constraint(model.S, model.T, rule=min_soc_ftm)
     
     # ==========================================================================
@@ -802,23 +957,47 @@ if __name__ == "__main__":
         print(f"✓ FCR capacity sufficient ({total_ftm:.0f} kW > 1000 kW)")
     
     # =========================================================================
-    # LOAD DATA
+    # DATE RANGE CONFIGURATION
+    # =========================================================================
+    # Option 1: Specify exact dates (recommended)
+    # Option 2: Set both to None for full year (warning: may take hours)
+    
+    # Examples:
+    #   START_DATE = "2024-01-01"    # Start of year
+    #   END_DATE = "2024-01-31"      # End of January (1 month)
+    #
+    #   START_DATE = "2024-06-15"    # Mid-June
+    #   END_DATE = "2024-06-21"      # One week
+    #
+    #   START_DATE = None            # From beginning of data
+    #   END_DATE = None              # To end of data (full year)
+    
+    START_DATE = "2024-01-01"   # Start date (YYYY-MM-DD or YYYY-MM-DD HH:MM)
+    END_DATE = "2024-01-07"     # End date - 1 week test
+    
+    # Peak tariff (EUR/kW/year) - will be prorated for simulation period
+    C_peak_annual = 192.66
+    
+    # =========================================================================
+    # LOAD DATA WITH DATE RANGE
     # =========================================================================
     
-    data_full = load_multi_site_data(
+    data = load_multi_site_data(
         data_dir=this_file,
         site_configs=site_configs,
         scale_loads_to_battery=True,
-        scaler_input=1.0
-
+        scaler_input=1.0,
+        start_date=START_DATE,
+        end_date=END_DATE
     )
     
-    # =========================================================================
-    # TIME HORIZON SELECTION
-    # =========================================================================
-    # For testing: use 1 week (672 steps). For full year: use data_full['T']
-    # Set to None for full year optimization (warning: may take hours)
+    # Prorate peak tariff based on simulation period
+    # (Peak charges are typically annual, so we scale for shorter periods)
+    simulation_days = data['num_steps'] / 96  # 96 steps per day
+    C_peak = C_peak_annual * (simulation_days / 365.0)
+    print(f"   Peak tariff prorated: €{C_peak_annual:.2f}/kW/year → €{C_peak:.2f}/kW for {simulation_days:.1f} days")
     
+<<<<<<< HEAD
     ### Scenarios
 
     btm_ratio = [0,0.2,0.4,0.6,0.8,1]
@@ -847,17 +1026,27 @@ if __name__ == "__main__":
         print(f"\n🕐 Using full year ({data['T']+1} steps)")
     
     # Generate FCR activation profile
+=======
+    # Load FCR activation profile for the same date range
+>>>>>>> 55d564a (feat: Separate model execution from dashboard generation)
     delta_t = 0.25
-    block_size = int(round(4.0 / delta_t))  # 16 steps = 4 hours
-    #fcr_signal = generate_fcr_activation_profile(
-       # num_steps=data['num_steps'],
-       # block_size=block_size,
-        #eta_ch=0.974,
-       # eta_dis=0.974,
-       # seed=42
-    #)
-
-    fcr_up, fcr_down = load_fcr_activation_profile(data_dir=this_file)
+    fcr_up, fcr_down = load_fcr_activation_profile(
+        data_dir=this_file,
+        start_date=START_DATE,
+        end_date=END_DATE
+    )
+    
+    # Handle FCR array length mismatch (pad or truncate to match data)
+    num_steps = data['num_steps']
+    if len(fcr_up) >= num_steps:
+        fcr_up = fcr_up[:num_steps]
+        fcr_down = fcr_down[:num_steps]
+    else:
+        # FCR data shorter - pad with zeros (no FCR activation)
+        pad_length = num_steps - len(fcr_up)
+        print(f"   ⚠️ FCR data shorter by {pad_length} steps - padding with zeros")
+        fcr_up = np.concatenate([fcr_up, np.zeros(pad_length)])
+        fcr_down = np.concatenate([fcr_down, np.zeros(pad_length)])
     
     # =========================================================================
     # BUILD AND SOLVE MODEL
@@ -884,15 +1073,40 @@ if __name__ == "__main__":
     print(f"  Constraints: {n_cons:,}")
     
     # =========================================================================
-    # SOLVER SELECTION (with fallbacks)
+    # SOLVER CONFIGURATION (Optimized for Large Problems)
     # =========================================================================
+    
+    # Performance tuning options (adjust these for your needs)
+    SOLVER_CONFIG = {
+        'MIPGap': 0.05,          # Accept 2% suboptimality (faster, usually good enough)
+        'TimeLimit': 3600,        # 1 hour max for full year (increase if needed)
+        'Threads': 0,             # 0 = use all available CPU cores
+        'Method': 2,              # 2 = Barrier method (often faster for large LPs)
+        'Presolve': 2,            # 2 = Aggressive presolve (reduces problem size)
+        'MIPFocus': 1,            # 1 = Focus on finding feasible solutions quickly
+        'Cuts': 2,                # 2 = Aggressive cuts (helps prove optimality)
+        'NodefileStart': 0.5,     # Start writing nodes to disk after 0.5 GB RAM
+        'NodefileDir': '/tmp',    # Directory for node files (saves RAM)
+        # 'PoolSearchMode': 2,    # Uncomment to find multiple good solutions
+    }
+    
+    # For very large problems (full year), consider these additional settings:
+    # SOLVER_CONFIG['MIPGap'] = 0.05      # Accept 5% gap for faster solve
+    # SOLVER_CONFIG['Heuristics'] = 0.2   # Spend 20% of time on heuristics
+    # SOLVER_CONFIG['RINS'] = 50          # Apply RINS heuristic every 50 nodes
     
     # Try solvers in order of preference
     SOLVER_OPTIONS = [
-        ('gurobi', {'MIPGap': 0.01, 'TimeLimit': 600}),
-        ('cplex', {'mip.tolerances.mipgap': 0.01, 'timelimit': 600}),
-        ('glpk', {'mipgap': 0.01}),
-        ('cbc', {}),
+        ('gurobi', SOLVER_CONFIG),
+        ('cplex', {
+            'mip.tolerances.mipgap': SOLVER_CONFIG['MIPGap'],
+            'timelimit': SOLVER_CONFIG['TimeLimit'],
+            'threads': SOLVER_CONFIG['Threads'],
+            'preprocessing.presolve': 1,
+            'mip.strategy.heuristicfreq': 10,
+        }),
+        ('glpk', {'mipgap': SOLVER_CONFIG['MIPGap']}),
+        ('cbc', {'ratio': SOLVER_CONFIG['MIPGap'], 'threads': SOLVER_CONFIG['Threads']}),
     ]
     
     solver = None
@@ -904,6 +1118,9 @@ if __name__ == "__main__":
                 for opt, val in options.items():
                     solver.options[opt] = val
                 print(f"\n✓ Using solver: {solver_name}")
+                print(f"  MIPGap: {SOLVER_CONFIG['MIPGap']*100:.0f}%")
+                print(f"  TimeLimit: {SOLVER_CONFIG['TimeLimit']}s")
+                print(f"  Threads: {'all' if SOLVER_CONFIG['Threads'] == 0 else SOLVER_CONFIG['Threads']}")
                 break
         except:
             continue
@@ -911,8 +1128,15 @@ if __name__ == "__main__":
     if solver is None:
         raise RuntimeError("No MILP solver available. Install Gurobi, CPLEX, GLPK, or CBC.")
     
-    print("\nSolving optimization problem...")
+    print("\n🚀 Starting optimization...")
+    print(f"   Problem size: {n_vars:,} variables, {n_cons:,} constraints")
+    print(f"   This may take a while for large problems. Progress shown below.\n")
+    
+    import time as time_module
+    solve_start = time_module.time()
     results = solver.solve(model, tee=True)
+    solve_time = time_module.time() - solve_start
+    print(f"\n⏱️  Solve time: {solve_time/60:.1f} minutes")
     
     # =========================================================================
     # EXTRACT RESULTS
@@ -936,59 +1160,95 @@ if __name__ == "__main__":
     print(f"Degradation Cost:      €{port['degradation_cost']:,.2f}")
     print(f"NET BENEFIT:           €{port['net_benefit']:,.2f}")
     
-    # Save results
+    # Save CSV results
     df.to_csv(this_file / "multi_battery_results.csv", index=False)
     print(f"\nResults saved to multi_battery_results.csv")
     
     # =========================================================================
-    # DASHBOARD
+    # SAVE RESULTS FOR LATER DASHBOARD GENERATION
     # =========================================================================
     
-    print("\n" + "=" * 60)
-    print("GENERATING DASHBOARD")
-    print("=" * 60)
+    SAVE_RESULTS = True  # Set to True to save results for later use
     
-    try:
-        from dashboard_multi_battery import (
-            create_multi_battery_dashboard, 
-            create_detailed_site_dashboard,
-            print_financial_summary,
-            generate_comparison_report
-        )
+    if SAVE_RESULTS:
+        try:
+            from results_io import save_optimization_results
+            
+            results_package = {
+                'df': df,
+                'financials': financials,
+                'model_status': 'optimal',
+            }
+            
+            save_optimization_results(
+                results=results_package,
+                data=data,
+                site_configs=site_configs,
+                metadata={
+                    'start_date': START_DATE,
+                    'end_date': END_DATE,
+                    'C_peak': C_peak,
+                    'delta_t': delta_t,
+                }
+            )
+        except Exception as e:
+            print(f"⚠️  Could not save results: {e}")
+    
+    # =========================================================================
+    # DASHBOARD (can be disabled if just saving results)
+    # =========================================================================
+    
+    GENERATE_DASHBOARD = True  # Set to False to skip dashboard generation
+    
+    if GENERATE_DASHBOARD:
+        print("\n" + "=" * 60)
+        print("GENERATING DASHBOARD")
+        print("=" * 60)
         
-        # Print detailed financial summary
-        print_financial_summary(financials)
-        
-        # Generate main dashboard
-        print("\nCreating portfolio dashboard...")
-        create_multi_battery_dashboard(
-            df, financials, site_configs, data, 
-            output_file=this_file / "multi_battery_dashboard.html"
-        )
-        
-        # Generate comparison report CSV
-        print("\nGenerating comparison report...")
-        generate_comparison_report(
-            df, financials, 
-            output_file=this_file / "site_comparison_report.csv"
-        )
-        
-        # Generate detailed dashboard for first site as example
-        first_site = site_configs[0].site_id
-        print(f"\nCreating detailed dashboard for {first_site}...")
-        create_detailed_site_dashboard(
-            df, first_site, financials, site_configs[0],
-            output_file=this_file / f"dashboard_{first_site}.html"
-        )
-        
-        print("\n✓ All dashboards generated successfully!")
-        print(f"  - multi_battery_dashboard.html (interactive portfolio view)")
-        print(f"  - site_comparison_report.csv (site-by-site metrics)")
-        print(f"  - dashboard_{first_site}.html (detailed site view)")
-        
-    except ImportError as e:
-        print(f"\n⚠️  Dashboard generation skipped: {e}")
-        print("   Run: python dashboard_multi_battery.py separately")
+        try:
+            from dashboard_multi_battery import (
+                create_multi_battery_dashboard, 
+                create_detailed_site_dashboard,
+                print_financial_summary,
+                generate_comparison_report
+            )
+            
+            # Print detailed financial summary
+            print_financial_summary(financials)
+            
+            # Generate main dashboard
+            print("\nCreating portfolio dashboard...")
+            create_multi_battery_dashboard(
+                df, financials, site_configs, data, 
+                output_file=this_file / "multi_battery_dashboard.html"
+            )
+            
+            # Generate comparison report CSV
+            print("\nGenerating comparison report...")
+            generate_comparison_report(
+                df, financials, 
+                output_file=this_file / "site_comparison_report.csv"
+            )
+            
+            # Generate detailed dashboard for first site as example
+            first_site = site_configs[0].site_id
+            print(f"\nCreating detailed dashboard for {first_site}...")
+            create_detailed_site_dashboard(
+                df, first_site, financials, site_configs[0],
+                output_file=this_file / f"dashboard_{first_site}.html"
+            )
+            
+            print("\n✓ All dashboards generated successfully!")
+            print(f"  - multi_battery_dashboard.html (interactive portfolio view)")
+            print(f"  - site_comparison_report.csv (site-by-site metrics)")
+            print(f"  - dashboard_{first_site}.html (detailed site view)")
+            
+        except ImportError as e:
+            print(f"\n⚠️  Dashboard generation skipped: {e}")
+            print("   Run: python generate_dashboard.py to create dashboards from saved results")
+    else:
+        print("\n⚠️  Dashboard generation skipped (GENERATE_DASHBOARD = False)")
+        print("   Run: python generate_dashboard.py to create dashboards from saved results")
     
     print("\n" + "=" * 60)
     print("OPTIMIZATION COMPLETE")

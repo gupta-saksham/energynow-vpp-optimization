@@ -211,12 +211,12 @@ def create_multi_battery_dashboard(
         vertical_spacing=0.03,
         row_heights=[0.18, 0.18, 0.15, 0.18, 0.15, 0.16],
         subplot_titles=(
-            '<b>1. GRID EXCHANGE</b> — Import (+) / Export (-)',
-            '<b>2. BATTERY OPERATIONS</b> — BTM (Local) vs FTM (Market)',
-            '<b>3. STATE OF CHARGE</b> — BTM & FTM Partitions',
-            '<b>4. MARKET SIGNALS</b> — Day-Ahead & FCR Prices',
-            '<b>5. FCR PARTICIPATION</b> — Aggregated Bid & Activations',
-            '<b>6. CUMULATIVE VALUE</b> — Revenue Streams Over Time'
+            '<b>1. GRID EXCHANGE</b> — Import (+) / Export (-) vs Original Demand',
+            '<b>2. BATTERY OPERATIONS</b> — BTM (Local Load) vs FTM (FCR Market)',
+            '<b>3. STATE OF CHARGE</b> — BTM & FTM Partitions with FCR Headroom',
+            '<b>4. MARKET SIGNALS</b> — Day-Ahead & FCR Capacity Prices',
+            '<b>5. FCR PARTICIPATION</b> — Aggregated Bid (≥1MW required)',
+            '<b>6. VALUE CREATION</b> — Baseline Cost vs Optimized + Revenue Streams'
         ),
         specs=[
             [{"secondary_y": True}],
@@ -439,79 +439,105 @@ def create_multi_battery_dashboard(
             ), row=5, col=1)
     
     # ==========================================================================
-    # ROW 6: CUMULATIVE VALUE (CLEAR ATTRIBUTION)
+    # ROW 6: CUMULATIVE VALUE (CORRECTED CALCULATIONS)
     # ==========================================================================
     
-    # ---- 1. PRICE ARBITRAGE (buying low, using/selling high) ----
-    # BTM + FTM arbitrage from day-ahead price differences
-    agg_df['arbitrage_value'] = (
-        (agg_df['P_dis_BTM'] + agg_df['P_dis_FTM'] - agg_df['P_ch_BTM'] - agg_df['P_ch_FTM']) 
-        * agg_df['Price'] * delta_t
-    )
-    agg_df['cum_arbitrage'] = agg_df['arbitrage_value'].cumsum()
+    # Get actual financials for accurate totals
+    port = financials['portfolio']
     
-    # Export value (selling back to grid)
-    agg_df['cum_export'] = (agg_df['P_sell'] * agg_df['Price'] * delta_t).cumsum()
+    # ---- CALCULATE EACH VALUE STREAM CORRECTLY ----
     
-    # ---- 2. PEAK SHAVING SAVINGS ----
-    # Peak savings = (baseline peak - optimized peak) × peak tariff
-    baseline_peak = agg_df['demand'].max()
-    peak_tariff = 192.66  # EUR/kW (network tariff)
-    current_peak_reduction = baseline_peak - agg_df['running_peak']
-    # Show progressive savings (fully realized at end of period)
-    agg_df['cum_peak_savings'] = current_peak_reduction * peak_tariff * np.arange(1, len(agg_df)+1) / len(agg_df)
+    # 1. BASELINE COST (what you would pay without battery)
+    agg_df['baseline_cost'] = agg_df['demand'] * agg_df['Price'] * delta_t
+    agg_df['cum_baseline'] = agg_df['baseline_cost'].cumsum()
     
-    # ---- 3. FCR REVENUE (capacity payment) ----
-    # ONLY count FCR revenue when bid >= 1 MW minimum requirement
+    # 2. OPTIMIZED COST (what you actually pay with battery)
+    agg_df['optimized_cost'] = (agg_df['P_buy'] - agg_df['P_sell']) * agg_df['Price'] * delta_t
+    agg_df['cum_optimized'] = agg_df['optimized_cost'].cumsum()
+    
+    # 3. ENERGY SAVINGS (baseline - optimized cost) = BTM value
+    agg_df['energy_savings'] = agg_df['baseline_cost'] - agg_df['optimized_cost']
+    agg_df['cum_energy_savings'] = agg_df['energy_savings'].cumsum()
+    
+    # 4. FCR REVENUE (capacity payment - only when bid >= 1 MW)
     fcr_min_met = agg_df['FCR_total'] >= 1000
-    agg_df['fcr_value'] = np.where(fcr_min_met, agg_df['FCR_price'] * agg_df['FCR_total'] * delta_t, 0)
-    agg_df['cum_fcr'] = agg_df['fcr_value'].cumsum()
+    agg_df['fcr_revenue'] = np.where(fcr_min_met, agg_df['FCR_price'] * agg_df['FCR_total'] * delta_t, 0)
+    agg_df['cum_fcr'] = agg_df['fcr_revenue'].cumsum()
     
-    # Plot each value stream with CLEAR labels
+    # 5. PEAK SAVINGS (realized at end of period, shown as progressive)
+    # This is the difference between baseline peak charge and optimized peak charge
+    baseline_peak_kw = agg_df['demand'].max()
+    optimized_peak_kw = agg_df['P_buy'].max()  # Final optimized peak
+    peak_savings_total = port['peak_savings']  # Use actual calculated value
+    # Show as linear progression (peak charge is billed at end of period)
+    progress = np.linspace(0, 1, len(agg_df))
+    agg_df['cum_peak_savings'] = peak_savings_total * progress
+    
+    # ---- PLOT: SAVINGS vs COST COMPARISON ----
+    
+    # Plot baseline cost (what you would have paid)
     fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['cum_arbitrage'],
-        name='Price Arbitrage (buy low/discharge high)',
-        stackgroup='revenue',
-        line=dict(width=0),
-        fillcolor='rgba(39,174,96,0.6)',
-        hovertemplate='Arbitrage: €%{y:,.0f}<extra></extra>'
+        x=agg_df['datetime'], y=agg_df['cum_baseline'],
+        name='Baseline Cost (no battery)',
+        line=dict(color='rgba(231,76,60,0.7)', width=2, dash='dot'),
+        hovertemplate='Without Battery: €%{y:,.0f}<extra></extra>'
     ), row=6, col=1)
     
+    # Plot optimized cost (what you actually paid)
     fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['cum_export'],
-        name='Export Revenue',
-        stackgroup='revenue',
-        line=dict(width=0),
-        fillcolor='rgba(52,152,219,0.6)',
-        hovertemplate='Export: €%{y:,.0f}<extra></extra>'
+        x=agg_df['datetime'], y=agg_df['cum_optimized'],
+        name='Optimized Energy Cost',
+        line=dict(color='rgba(52,152,219,0.7)', width=2),
+        hovertemplate='With Battery: €%{y:,.0f}<extra></extra>'
     ), row=6, col=1)
     
+    # ---- PLOT: CUMULATIVE VALUE BREAKDOWN (stacked) ----
+    
+    # Energy arbitrage savings (green area)
     fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['cum_peak_savings'],
-        name='Peak Shaving Savings',
-        stackgroup='revenue',
+        x=agg_df['datetime'], y=agg_df['cum_energy_savings'],
+        name='Energy Arbitrage Savings',
+        fill='tozeroy',
         line=dict(width=0),
-        fillcolor='rgba(241,196,15,0.6)',
-        hovertemplate='Peak Savings: €%{y:,.0f}<extra></extra>'
+        fillcolor='rgba(39,174,96,0.5)',
+        hovertemplate='Energy Savings: €%{y:,.0f}<extra></extra>'
     ), row=6, col=1)
     
+    # FCR revenue (purple - stacked on top)
     fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['cum_fcr'],
-        name='FCR Revenue (≥1MW bids only)',
-        stackgroup='revenue',
+        x=agg_df['datetime'], y=agg_df['cum_energy_savings'] + agg_df['cum_fcr'],
+        name='+ FCR Revenue',
+        fill='tonexty',
         line=dict(width=0),
-        fillcolor='rgba(142,68,173,0.6)',
+        fillcolor='rgba(142,68,173,0.5)',
         hovertemplate='FCR: €%{y:,.0f}<extra></extra>'
     ), row=6, col=1)
     
-    # Total line
-    total_cum = agg_df['cum_arbitrage'] + agg_df['cum_export'] + agg_df['cum_peak_savings'] + agg_df['cum_fcr']
+    # Peak savings (yellow - stacked on top, shown as progressive)
+    total_cum_value = agg_df['cum_energy_savings'] + agg_df['cum_fcr'] + agg_df['cum_peak_savings']
     fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=total_cum,
-        name='Total Value',
-        line=dict(color='black', width=2, dash='dash'),
-        hovertemplate='Total: €%{y:,.0f}<extra></extra>'
+        x=agg_df['datetime'], y=total_cum_value,
+        name='+ Peak Savings',
+        fill='tonexty',
+        line=dict(width=0),
+        fillcolor='rgba(241,196,15,0.5)',
+        hovertemplate='Total Value: €%{y:,.0f}<extra></extra>'
     ), row=6, col=1)
+    
+    # Net benefit line (after degradation)
+    final_net_benefit = port['net_benefit']
+    degradation_cost = port['degradation_cost']
+    net_benefit_cum = total_cum_value - (degradation_cost * progress)
+    
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=net_benefit_cum,
+        name='Net Benefit (after degradation)',
+        line=dict(color='black', width=3),
+        hovertemplate='Net Benefit: €%{y:,.0f}<extra></extra>'
+    ), row=6, col=1)
+    
+    # Zero line reference
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1, row=6, col=1)
     
     # ==========================================================================
     # LAYOUT
@@ -540,18 +566,27 @@ def create_multi_battery_dashboard(
         # Add KPI annotation box with clear value attribution
         annotations=[
             dict(
-                text=f"<b>Portfolio Summary</b><br>"
-                     f"────────────────────<br>"
-                     f"Sites: {len(site_ids)} | Capacity: {total_E_max:,.0f} kWh<br>"
-                     f"FTM Power: {sum(c.battery.P_max*(1-c.btm_ratio) for c in site_configs):,.0f} kW<br>"
+                text=f"<b>📊 PORTFOLIO SUMMARY</b><br>"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
+                     f"Sites: {len(site_ids)} | Batteries: {total_E_max:,.0f} kWh<br>"
+                     f"FTM (Market): {sum(c.battery.P_max*(1-c.btm_ratio) for c in site_configs):,.0f} kW<br>"
                      f"<br>"
-                     f"<b>VALUE ATTRIBUTION</b><br>"
-                     f"────────────────────<br>"
-                     f"🟢 BTM Arbitrage: €{financials['portfolio']['btm_savings']:,.0f}<br>"
-                     f"🟡 Peak Shaving:  €{financials['portfolio']['peak_savings']:,.0f}<br>"
-                     f"🟣 FCR Revenue:   €{financials['portfolio']['fcr_revenue']:,.0f}<br>"
-                     f"────────────────────<br>"
-                     f"<b>NET BENEFIT: €{financials['portfolio']['net_benefit']:,.0f}</b>",
+                     f"<b>💰 COSTS</b><br>"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
+                     f"Baseline (no battery): €{port['baseline_energy'] + port['baseline_peak']:,.0f}<br>"
+                     f"Optimized cost:        €{port['energy_cost'] + port['peak_cost']:,.0f}<br>"
+                     f"<br>"
+                     f"<b>📈 VALUE BREAKDOWN</b><br>"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
+                     f"🟢 Energy Arbitrage:   €{port['btm_savings']:>+10,.0f}<br>"
+                     f"   (buy low, use high)<br>"
+                     f"🟡 Peak Reduction:     €{port['peak_savings']:>+10,.0f}<br>"
+                     f"   ({baseline_peak_kw:.0f}→{optimized_peak_kw:.0f} kW)<br>"
+                     f"🟣 FCR Revenue:        €{port['fcr_revenue']:>+10,.0f}<br>"
+                     f"   (capacity payments)<br>"
+                     f"🔴 Degradation:        €{-port['degradation_cost']:>+10,.0f}<br>"
+                     f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
+                     f"<b>✅ NET BENEFIT:        €{port['net_benefit']:>+10,.0f}</b>",
                 xref='paper', yref='paper',
                 x=1.02, y=0.98,
                 showarrow=False,
@@ -559,7 +594,7 @@ def create_multi_battery_dashboard(
                 bgcolor='rgba(255,255,255,0.95)',
                 bordercolor='#34495e',
                 borderwidth=2,
-                borderpad=8,
+                borderpad=10,
                 align='left'
             )
         ]
@@ -933,43 +968,106 @@ def create_detailed_site_dashboard(
 # =============================================================================
 
 def print_financial_summary(financials: Dict):
-    """Print formatted financial summary to console."""
+    """Print formatted financial summary to console with clear explanations."""
     
-    print("\n" + "=" * 80)
-    print("FINANCIAL SUMMARY")
-    print("=" * 80)
+    port = financials['portfolio']
     
-    # Per-site breakdown
-    print("\n--- PER-SITE BREAKDOWN ---")
-    print(f"{'Site':<12} {'BTM Sav':>10} {'Peak Sav':>10} {'FCR Rev':>10} {'Deg Cost':>10} {'Net':>12}")
-    print("-" * 80)
+    print("\n" + "=" * 90)
+    print("💰 FINANCIAL SUMMARY - VALUE ATTRIBUTION")
+    print("=" * 90)
+    
+    # ==========================================================================
+    # COST COMPARISON
+    # ==========================================================================
+    print("\n📊 COST COMPARISON (Energy + Peak Charges)")
+    print("-" * 90)
+    
+    baseline_total = port['baseline_energy'] + port['baseline_peak']
+    optimized_total = port['energy_cost'] + port['peak_cost']
+    gross_savings = baseline_total - optimized_total
+    
+    print(f"  WITHOUT BATTERY (Baseline):")
+    print(f"    Energy Cost:         €{port['baseline_energy']:>12,.0f}  (demand × spot price)")
+    print(f"    Peak Charge:         €{port['baseline_peak']:>12,.0f}  (max demand × peak tariff)")
+    print(f"    ─────────────────────────────────────")
+    print(f"    TOTAL:               €{baseline_total:>12,.0f}")
+    
+    print(f"\n  WITH BATTERY (Optimized):")
+    print(f"    Energy Cost:         €{port['energy_cost']:>12,.0f}  (net grid × spot price)")
+    print(f"    Peak Charge:         €{port['peak_cost']:>12,.0f}  (reduced peak × peak tariff)")
+    print(f"    ─────────────────────────────────────")
+    print(f"    TOTAL:               €{optimized_total:>12,.0f}")
+    
+    print(f"\n  GROSS SAVINGS:         €{gross_savings:>12,.0f}  (baseline - optimized)")
+    
+    # ==========================================================================
+    # VALUE ATTRIBUTION
+    # ==========================================================================
+    print("\n📈 VALUE ATTRIBUTION (Where does the benefit come from?)")
+    print("-" * 90)
+    
+    print(f"  🟢 ENERGY ARBITRAGE:   €{port['btm_savings']:>+12,.0f}")
+    print(f"      = Baseline energy cost - Optimized energy cost")
+    print(f"      = €{port['baseline_energy']:,.0f} - €{port['energy_cost']:,.0f} = €{port['btm_savings']:,.0f}")
+    print(f"      (Value from buying low, discharging when prices high)")
+    
+    print(f"\n  🟡 PEAK REDUCTION:     €{port['peak_savings']:>+12,.0f}")
+    print(f"      = Baseline peak charge - Optimized peak charge")
+    print(f"      = €{port['baseline_peak']:,.0f} - €{port['peak_cost']:,.0f} = €{port['peak_savings']:,.0f}")
+    if port['peak_savings'] < 0:
+        print(f"      ⚠️  NEGATIVE: Battery charging/FCR increased grid peak above demand.")
+        print(f"         This is optimal when FCR revenue > peak penalty.")
+    else:
+        print(f"      (Value from reducing maximum grid import)")
+    
+    print(f"\n  🟣 FCR REVENUE:        €{port['fcr_revenue']:>+12,.0f}")
+    print(f"      (Capacity payments for frequency regulation)")
+    
+    print(f"\n  🔴 DEGRADATION COST:   €{-port['degradation_cost']:>+12,.0f}")
+    print(f"      (Battery wear from cycling)")
+    
+    # ==========================================================================
+    # NET BENEFIT CALCULATION
+    # ==========================================================================
+    print("\n" + "-" * 90)
+    print("✅ NET BENEFIT CALCULATION:")
+    print(f"   Energy Arbitrage  {port['btm_savings']:>+12,.0f}")
+    print(f"   Peak Reduction    {port['peak_savings']:>+12,.0f}")
+    print(f"   FCR Revenue       {port['fcr_revenue']:>+12,.0f}")
+    print(f"   Degradation       {-port['degradation_cost']:>+12,.0f}")
+    print(f"   ─────────────────────────────────────")
+    calculated_net = port['btm_savings'] + port['peak_savings'] + port['fcr_revenue'] - port['degradation_cost']
+    print(f"   NET BENEFIT       €{calculated_net:>+11,.0f}")
+    
+    if abs(calculated_net - port['net_benefit']) > 1:
+        print(f"   ⚠️  MISMATCH: Stored value = €{port['net_benefit']:,.0f}")
+    
+    print("=" * 90)
+    
+    # ==========================================================================
+    # PER-SITE BREAKDOWN (condensed)
+    # ==========================================================================
+    print("\n📋 PER-SITE BREAKDOWN")
+    print("-" * 90)
+    print(f"{'Site':<12} {'Energy Arb':>12} {'Peak Red':>12} {'FCR Rev':>12} {'Degrad':>10} {'Net':>14}")
+    print("-" * 90)
     
     for site_id, data in financials['sites'].items():
         print(f"{site_id:<12} "
-              f"€{data['btm_savings']:>9,.0f} "
-              f"€{data['peak_savings']:>9,.0f} "
-              f"€{data['fcr_revenue']:>9,.0f} "
-              f"€{data['degradation_cost']:>9,.0f} "
-              f"€{data['net_benefit']:>11,.0f}")
+              f"€{data['btm_savings']:>+11,.0f} "
+              f"€{data['peak_savings']:>+11,.0f} "
+              f"€{data['fcr_revenue']:>+11,.0f} "
+              f"€{-data['degradation_cost']:>+9,.0f} "
+              f"€{data['net_benefit']:>+13,.0f}")
     
-    # Portfolio totals
-    print("-" * 80)
-    port = financials['portfolio']
+    print("-" * 90)
     print(f"{'TOTAL':<12} "
-          f"€{port['btm_savings']:>9,.0f} "
-          f"€{port['peak_savings']:>9,.0f} "
-          f"€{port['fcr_revenue']:>9,.0f} "
-          f"€{port['degradation_cost']:>9,.0f} "
-          f"€{port['net_benefit']:>11,.0f}")
-    
-    print("\n--- PORTFOLIO KPIs ---")
-    print(f"Total Baseline Cost:    €{port['baseline_energy'] + port['baseline_peak']:>12,.0f}")
-    print(f"Total Optimized Cost:   €{port['energy_cost'] + port['peak_cost']:>12,.0f}")
-    print(f"Total Savings:          €{port['btm_savings'] + port['peak_savings']:>12,.0f}")
-    print(f"FCR Revenue:            €{port['fcr_revenue']:>12,.0f}")
-    print(f"Degradation Cost:       €{port['degradation_cost']:>12,.0f}")
-    print(f"NET PORTFOLIO BENEFIT:  €{port['net_benefit']:>12,.0f}")
-    print("=" * 80)
+          f"€{port['btm_savings']:>+11,.0f} "
+          f"€{port['peak_savings']:>+11,.0f} "
+          f"€{port['fcr_revenue']:>+11,.0f} "
+          f"€{-port['degradation_cost']:>+9,.0f} "
+          f"€{port['net_benefit']:>+13,.0f}")
+    print("=" * 90)
 
 
 def generate_comparison_report(df: pd.DataFrame, financials: Dict, output_file: Path = None):

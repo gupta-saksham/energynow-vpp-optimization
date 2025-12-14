@@ -24,7 +24,8 @@ from pyomo.environ import SolverFactory, value, Var, Constraint
 
 from model_multi_battery import (
     SiteConfig, BatterySpec, 
-    load_multi_site_data, generate_fcr_activation_profile,
+    load_multi_site_data, generate_fcr_activation_profile, load_fcr_activation_profile,
+    filter_data_by_date_range,
     build_multi_battery_model, extract_results, calculate_financials
 )
 
@@ -90,14 +91,29 @@ def run_single_scenario(
     scaler_input: float,
     site_configs_template: List[SiteConfig],
     base_data: Dict,
-    fcr_signal: np.ndarray,
+    fcr_signal_up: np.ndarray,
+    fcr_signal_down: np.ndarray,
     delta_t: float = 0.25,
     C_peak: float = 192.66,
-    horizon_days: int = 7,
+    start_date: str = None,
+    end_date: str = None,
     verbose: bool = False
 ) -> ScenarioResult:
     """
     Run a single scenario with given btm_ratio and scaler_input.
+    
+    Args:
+        btm_ratio: Fraction of battery for BTM (0.0 to 1.0)
+        scaler_input: Load scaling factor
+        site_configs_template: Template site configurations
+        base_data: Pre-loaded data dictionary
+        fcr_signal_up: FCR upward activation profile
+        fcr_signal_down: FCR downward activation profile
+        delta_t: Timestep in hours (default 0.25 = 15 min)
+        C_peak: Peak tariff (already prorated for simulation period)
+        start_date: Start date for simulation (e.g., "2024-03-01")
+        end_date: End date for simulation (e.g., "2024-03-31")
+        verbose: Print detailed output
     """
     
     scenario_id = f"btm{btm_ratio:.1f}_scale{scaler_input:.1f}"
@@ -127,28 +143,30 @@ def run_single_scenario(
             P_sell_max=adjusted_P_max   # Scaled to handle larger exports
         ))
     
-    # Load data with scaler
-    data_full = load_multi_site_data(
+    # Load data with scaler and date range
+    data = load_multi_site_data(
         data_dir=this_file,
         site_configs=site_configs,
         scale_loads_to_battery=True,
-        scaler_input=scaler_input
+        scaler_input=scaler_input,
+        start_date=start_date,
+        end_date=end_date
     )
     
-    # Truncate to horizon
-    T_horizon = min(horizon_days * 24 * 4 - 1, data_full['T'])
-    data = {
-        'day_ahead': data_full['day_ahead'][:T_horizon+1],
-        'fcr_prices': data_full['fcr_prices'][:T_horizon+1],
-        'site_loads': {k: v[:T_horizon+1] for k, v in data_full['site_loads'].items()},
-        'T': T_horizon,
-        'num_steps': T_horizon + 1,
-        'time_index': data_full['time_index'][:T_horizon+1],
-        'scale_factors': data_full['scale_factors']
-    }
+    # FCR signals should match the data length
+    # Handle length mismatch: pad with zeros or truncate as needed
+    num_steps = data['num_steps']
     
-    # Truncate FCR signal
-    fcr_signal_truncated = fcr_signal[:T_horizon+1]
+    if len(fcr_signal_up) >= num_steps:
+        fcr_signal_up_truncated = fcr_signal_up[:num_steps]
+        fcr_signal_down_truncated = fcr_signal_down[:num_steps]
+    else:
+        # FCR data shorter than needed - pad with zeros (no FCR activation)
+        pad_length = num_steps - len(fcr_signal_up)
+        if verbose:
+            print(f"  ⚠️ FCR data shorter by {pad_length} steps - padding with zeros")
+        fcr_signal_up_truncated = np.concatenate([fcr_signal_up, np.zeros(pad_length)])
+        fcr_signal_down_truncated = np.concatenate([fcr_signal_down, np.zeros(pad_length)])
     
     # Calculate total FTM capacity
     total_ftm_capacity = sum(cfg.battery.P_max * (1 - cfg.btm_ratio) for cfg in site_configs)
@@ -182,7 +200,8 @@ def run_single_scenario(
         model = build_multi_battery_model(
             site_configs=site_configs,
             data=data_adjusted,
-            fcr_signal=fcr_signal_truncated,
+            fcr_signal_up=fcr_signal_up_truncated,
+            fcr_signal_down=fcr_signal_down_truncated,
             delta_t=delta_t,
             SOC0=0.5,
             SOH0=1.0,
@@ -190,13 +209,35 @@ def run_single_scenario(
             min_fcr_bid=min_fcr_bid,
         )
         
-        # Solve
+        # Solve - configure based on problem size
         solver = SolverFactory('gurobi')
-        solver.options['MIPGap'] = 0.02  # 2% gap for faster solving
-        solver.options['TimeLimit'] = 300  # 5 minute limit
-        solver.options['OutputFlag'] = 0  # Suppress output
         
-        results = solver.solve(model, tee=False)
+        # Calculate appropriate time limit based on problem size
+        num_timesteps = data['num_steps']
+        num_sites = len(site_configs)
+        problem_size = num_timesteps * num_sites
+        
+        # Time limit: 5 min for small, up to 2 hours for full year
+        if problem_size < 10000:
+            time_limit = 300       # 5 min for ~1 week
+        elif problem_size < 100000:
+            time_limit = 1800      # 30 min for ~1 month
+        else:
+            time_limit = 7200      # 2 hours for full year
+        
+        solver.options['MIPGap'] = 0.05           # Accept 5% gap for faster solving
+        solver.options['TimeLimit'] = time_limit
+        solver.options['Threads'] = 0             # Use all CPU cores
+        solver.options['Method'] = 2              # Barrier method
+        solver.options['Presolve'] = 2            # Aggressive presolve
+        solver.options['MIPFocus'] = 1            # Focus on feasibility
+        solver.options['OutputFlag'] = 1          # Show output for debugging
+        
+        if verbose:
+            print(f"    Problem: {num_timesteps:,} timesteps × {num_sites} sites")
+            print(f"    TimeLimit: {time_limit//60} min, MIPGap: 5%")
+        
+        results = solver.solve(model, tee=verbose)
         
         solve_time = time.time() - start_time
         
@@ -204,6 +245,14 @@ def run_single_scenario(
         from pyomo.opt import TerminationCondition
         term_cond = results.solver.termination_condition
         if term_cond not in [TerminationCondition.optimal, TerminationCondition.feasible]:
+            # Provide helpful error message
+            if term_cond == TerminationCondition.maxTimeLimit:
+                print(f"    ⚠️  TIMEOUT after {solve_time:.0f}s - try shorter date range or increase TimeLimit")
+            elif term_cond == TerminationCondition.infeasible:
+                print(f"    ❌ INFEASIBLE - model constraints cannot be satisfied")
+            else:
+                print(f"    ❌ FAILED: {term_cond}")
+            
             infeasible_result = ScenarioResult(
                 btm_ratio=btm_ratio, scaler_input=scaler_input, scenario_id=scenario_id,
                 feasible=False, solver_status=str(term_cond), solve_time=solve_time,
@@ -360,7 +409,9 @@ def run_all_scenarios(
     btm_ratios: List[float],
     scaler_inputs: List[float],
     site_configs_template: List[SiteConfig],
-    horizon_days: int = 7,
+    start_date: str = None,
+    end_date: str = None,
+    C_peak_annual: float = 192.66,
     verbose: bool = True,
     output_dir: Path = None,
     generate_individual_dashboards: bool = True
@@ -372,33 +423,40 @@ def run_all_scenarios(
         btm_ratios: List of BTM ratios to test
         scaler_inputs: List of load scalers to test
         site_configs_template: Template site configurations
-        horizon_days: Optimization horizon in days
+        start_date: Start date for simulation (e.g., "2024-03-01")
+        end_date: End date for simulation (e.g., "2024-03-31")
+        C_peak_annual: Annual peak tariff in EUR/kW (will be prorated)
         verbose: Print progress
         output_dir: Directory to save outputs (created if not exists)
         generate_individual_dashboards: Generate per-scenario dashboards
     
     Returns:
         Tuple of (results_df, scenario_data_dict)
+    
+    Examples:
+        # Run scenarios for one week
+        results_df, data = run_all_scenarios(
+            btm_ratios=[0.2, 0.4, 0.6],
+            scaler_inputs=[0.5, 1.0, 2.0],
+            site_configs_template=configs,
+            start_date="2024-06-01",
+            end_date="2024-06-07"
+        )
+        
+        # Run scenarios for full month
+        results_df, data = run_all_scenarios(
+            btm_ratios=[0.4],
+            scaler_inputs=[1.0],
+            site_configs_template=configs,
+            start_date="2024-07-01",
+            end_date="2024-07-31"
+        )
     """
     
     # Import dashboard functions
     from dashboard_multi_battery import create_multi_battery_dashboard
     
-    print("\n" + "="*70)
-    print("SCENARIO ANALYSIS")
-    print("="*70)
-    print(f"BTM Ratios: {btm_ratios}")
-    print(f"Scaler Inputs: {scaler_inputs}")
-    print(f"Total Scenarios: {len(btm_ratios) * len(scaler_inputs)}")
-    print(f"Horizon: {horizon_days} days")
-    print("="*70)
-    
-    # Create output directory
-    if output_dir is None:
-        output_dir = this_file / "scenario_outputs"
-    output_dir.mkdir(exist_ok=True)
-    
-    # Pre-load base data for one scenario to get FCR signal
+    # Pre-load base data to get date range info
     print("\nPre-loading base data...")
     base_configs = [SiteConfig(
         site_id=cfg.site_id,
@@ -413,19 +471,37 @@ def run_all_scenarios(
         data_dir=this_file,
         site_configs=base_configs,
         scale_loads_to_battery=True,
-        scaler_input=1.0
+        scaler_input=1.0,
+        start_date=start_date,
+        end_date=end_date
     )
     
-    # Generate consistent FCR signal
-    T_horizon = min(horizon_days * 24 * 4 - 1, base_data['T'])
+    # Calculate prorated peak tariff
+    simulation_days = base_data['num_steps'] / 96
+    C_peak = C_peak_annual * (simulation_days / 365.0)
+    
+    print("\n" + "="*70)
+    print("SCENARIO ANALYSIS")
+    print("="*70)
+    print(f"BTM Ratios: {btm_ratios}")
+    print(f"Scaler Inputs: {scaler_inputs}")
+    print(f"Total Scenarios: {len(btm_ratios) * len(scaler_inputs)}")
+    print(f"Date Range: {base_data['time_index'][0]} to {base_data['time_index'][-1]}")
+    print(f"Duration: {simulation_days:.1f} days ({base_data['num_steps']} timesteps)")
+    print(f"Peak Tariff: €{C_peak:.2f} (prorated from €{C_peak_annual:.2f}/year)")
+    print("="*70)
+    
+    # Create output directory
+    if output_dir is None:
+        output_dir = this_file / "scenario_outputs"
+    output_dir.mkdir(exist_ok=True)
+    
+    # Load FCR activation profiles for the date range
     delta_t = 0.25
-    block_size = int(round(4.0 / delta_t))
-    fcr_signal = generate_fcr_activation_profile(
-        num_steps=T_horizon + 1,
-        block_size=block_size,
-        eta_ch=0.974,
-        eta_dis=0.974,
-        seed=42  # Fixed seed for reproducibility
+    fcr_signal_up, fcr_signal_down = load_fcr_activation_profile(
+        data_dir=this_file,
+        start_date=start_date,
+        end_date=end_date
     )
     
     # Run all scenarios
@@ -444,9 +520,12 @@ def run_all_scenarios(
                 scaler_input=scaler,
                 site_configs_template=site_configs_template,
                 base_data=base_data,
-                fcr_signal=fcr_signal,
+                fcr_signal_up=fcr_signal_up,
+                fcr_signal_down=fcr_signal_down,
                 delta_t=delta_t,
-                horizon_days=horizon_days,
+                C_peak=C_peak,
+                start_date=start_date,
+                end_date=end_date,
                 verbose=verbose
             )
             
@@ -1026,6 +1105,11 @@ def create_detailed_insights_report(
     
     df = results_df[results_df['feasible']].copy()
     
+    # Handle empty dataframe
+    if len(df) == 0:
+        print("⚠️  No feasible scenarios to create insights report!")
+        return None
+    
     fig = make_subplots(
         rows=3, cols=2,
         subplot_titles=(
@@ -1282,15 +1366,36 @@ if __name__ == "__main__":
     print("MULTI-BATTERY VPP - SCENARIO ANALYSIS")
     print("="*70)
     
-    # Define scenario parameters
+    # =========================================================================
+    # DATE RANGE CONFIGURATION
+    # =========================================================================
+    # Specify the simulation period (YYYY-MM-DD format)
+    
+    START_DATE = "2024-01-01"   # Start date
+    END_DATE = "2024-01-07"     # End date (1 week for testing)
+    
+    # For longer periods:
+    # START_DATE = "2024-01-01"
+    # END_DATE = "2024-01-31"    # Full month
+    
+    # For full year (warning: very slow):
+    # START_DATE = None
+    # END_DATE = None
+    
+    # =========================================================================
+    # SCENARIO PARAMETERS  
+    # =========================================================================
+    
     # Reduced set for initial testing - avoiding edge cases (0.0 and 1.0 btm_ratio)
-    BTM_RATIOS = [0.2, 0.4, 0.6, 0.8]  # Skip 0.0 and 1.0 edge cases
-    SCALER_INPUTS = [0.5, 1.0, 2.0]     # 3 representative scalers
-    HORIZON_DAYS = 7  # 1 week for faster runs
+    BTM_RATIOS = [0.4,0.8]  # Skip 0.0 and 1.0 edge cases
+    SCALER_INPUTS = [1.0]              # Single scaler for quick test
     
     # Full set (uncomment when ready):
     # BTM_RATIOS = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
     # SCALER_INPUTS = [0.2, 0.5, 1.0, 1.5, 5.0]
+    
+    # Annual peak tariff (EUR/kW/year) - will be prorated for simulation period
+    C_PEAK_ANNUAL = 192.66
     
     # Create template site configs (will be modified per scenario)
     load_columns = ['LG 01', 'LG 02', 'LG 03', 'LG 04', 'LG 05',
@@ -1326,7 +1431,9 @@ if __name__ == "__main__":
         btm_ratios=BTM_RATIOS,
         scaler_inputs=SCALER_INPUTS,
         site_configs_template=site_configs_template,
-        horizon_days=HORIZON_DAYS,
+        start_date=START_DATE,
+        end_date=END_DATE,
+        C_peak_annual=C_PEAK_ANNUAL,
         verbose=True,
         output_dir=output_dir,
         generate_individual_dashboards=True
@@ -1336,38 +1443,94 @@ if __name__ == "__main__":
     results_df.to_csv(this_file / "scenario_results.csv", index=False)
     print(f"\nResults saved to scenario_results.csv")
     
+    # =========================================================================
+    # SAVE RESULTS FOR LATER DASHBOARD GENERATION
+    # =========================================================================
+    
+    SAVE_RESULTS = True  # Set to True to save results for later use
+    
+    if SAVE_RESULTS:
+        try:
+            from results_io import save_scenario_results
+            
+            # Build base_data info for saving
+            base_data_info = {
+                'time_index': scenario_data[0]['time_index'] if scenario_data else [],
+                'num_steps': scenario_data[0]['num_steps'] if scenario_data else 0,
+                'num_sites': scenario_data[0]['num_sites'] if scenario_data else 0,
+                'site_names': scenario_data[0].get('site_names', []) if scenario_data else [],
+            }
+            
+            save_scenario_results(
+                results_df=results_df,
+                all_results=scenario_data,
+                base_data=base_data_info,
+                metadata={
+                    'start_date': START_DATE,
+                    'end_date': END_DATE,
+                    'btm_ratios': BTM_RATIOS,
+                    'scaler_inputs': SCALER_INPUTS,
+                    'C_peak_annual': C_PEAK_ANNUAL,
+                }
+            )
+        except Exception as e:
+            print(f"⚠️  Could not save results: {e}")
+    
     # Print summary
     print_scenario_summary(results_df)
     
-    # Create comparison visualizations
-    print("\nGenerating comparison visualizations...")
+    # Check if any scenarios were feasible
+    n_feasible = results_df['feasible'].sum() if 'feasible' in results_df.columns else 0
     
-    create_scenario_comparison_dashboard(
-        results_df,
-        output_file=this_file / "scenario_comparison_dashboard.html"
-    )
+    # =========================================================================
+    # DASHBOARD GENERATION (can be disabled)
+    # =========================================================================
     
-    create_detailed_insights_report(
-        results_df,
-        output_file=this_file / "scenario_insights.html"
-    )
+    GENERATE_DASHBOARDS = True  # Set to False to skip dashboard generation
     
-    # Create master navigation page
-    print("\nGenerating master navigation...")
-    create_master_navigation(
-        results_df,
-        output_dir=output_dir,
-        output_file=this_file / "scenario_master.html"
-    )
-    
-    print("\n" + "="*70)
-    print("✓ SCENARIO ANALYSIS COMPLETE!")
-    print("="*70)
-    print("\nGenerated files:")
-    print(f"  📄 scenario_results.csv - Raw results data")
-    print(f"  🌐 scenario_master.html - MASTER NAVIGATION (start here!)")
-    print(f"  📊 scenario_comparison_dashboard.html - Comparison heatmaps")
-    print(f"  📈 scenario_insights.html - Detailed insights")
-    print(f"  📁 scenario_outputs/ - Individual scenario dashboards")
-    print(f"\nOpen scenario_master.html in your browser to navigate all results!")
+    if n_feasible == 0:
+        print("\n" + "="*70)
+        print("⚠️  NO FEASIBLE SCENARIOS FOUND")
+        print("="*70)
+        print("\nPossible causes:")
+        print("  1. Solver not installed or not working (check Gurobi/CPLEX/CBC)")
+        print("  2. Model is infeasible (check constraints)")
+        print("  3. Solver timeout (increase TimeLimit)")
+        print("  4. Memory issues (try smaller date range)")
+        print("\nCheck the terminal output above for solver error messages.")
+    elif GENERATE_DASHBOARDS:
+        # Create comparison visualizations
+        print("\nGenerating comparison visualizations...")
+        
+        fig1 = create_scenario_comparison_dashboard(
+            results_df,
+            output_file=this_file / "scenario_comparison_dashboard.html"
+        )
+        
+        fig2 = create_detailed_insights_report(
+            results_df,
+            output_file=this_file / "scenario_insights.html"
+        )
+        
+        # Create master navigation page
+        print("\nGenerating master navigation...")
+        create_master_navigation(
+            results_df,
+            output_dir=output_dir,
+            output_file=this_file / "scenario_master.html"
+        )
+        
+        print("\n" + "="*70)
+        print("✓ SCENARIO ANALYSIS COMPLETE!")
+        print("="*70)
+        print("\nGenerated files:")
+        print(f"  📄 scenario_results.csv - Raw results data")
+        print(f"  🌐 scenario_master.html - MASTER NAVIGATION (start here!)")
+        print(f"  📊 scenario_comparison_dashboard.html - Comparison heatmaps")
+        print(f"  📈 scenario_insights.html - Detailed insights")
+        print(f"  📁 scenario_outputs/ - Individual scenario dashboards")
+        print(f"\nOpen scenario_master.html in your browser to navigate all results!")
+    else:
+        print("\n⚠️  Dashboard generation skipped (GENERATE_DASHBOARDS = False)")
+        print("   Run: python generate_dashboard.py --scenarios to create dashboards from saved results")
 
