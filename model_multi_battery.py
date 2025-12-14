@@ -566,7 +566,7 @@ def build_multi_battery_model(
         # To get effective power: P_FCR_bid * (signal / 900) = average power during slot
         # Positive signal (up) = battery charges (absorbs power)
         # Negative signal (down) = battery discharges (injects power)
-        fcr_activation_fraction = (m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 900.0
+        fcr_activation_fraction = (m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 3600.0
         fcr_avg_power = m.P_FCR_bid[s, t] * fcr_activation_fraction  # kW (can be negative)
         return m.SOC_FTM[s, t+1] == m.SOC_FTM[s, t] + \
                (eta_ch * m.P_ch_FTM[s, t] - (1/eta_dis) * m.P_dis_FTM[s, t] + fcr_avg_power) * m.delta_t
@@ -588,9 +588,7 @@ def build_multi_battery_model(
         # Reserve headroom for FCR charging
         # Worst case: full upward activation for entire 15-min slot
         # Energy reserved = P_FCR_bid (kW) * delta_t (h) * eta_ch = kWh
-        # FCR_max_factor normalizes: actual activation seconds / 900 seconds per 15min
-        # So we divide by 900 to convert sum-of-seconds back to fraction
-        fcr_headroom = m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s] * (m.FCR_max_factor / 900.0)
+        fcr_headroom = m.P_FCR_bid[s, t] * m.delta_t * m.eta_ch[s] * (m.FCR_max_factor / 3600.0)
         return m.SOC_FTM[s, t] <= (m.E_bat_current[s, t] * m.ftm_ratio[s]) - fcr_headroom
     model.Max_SOC_FTM = Constraint(model.S, model.T, rule=max_soc_ftm)
     
@@ -599,7 +597,7 @@ def build_multi_battery_model(
         # Worst case: full downward activation for entire 15-min slot
         # Energy reserved = P_FCR_bid (kW) * delta_t (h) / eta_dis = kWh
         # FCR_max_factor normalizes: actual activation seconds / 900 seconds per 15min
-        fcr_floor = m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s]) * (m.FCR_max_factor / 900.0)
+        fcr_floor = m.P_FCR_bid[s, t] * m.delta_t * (1/m.eta_dis[s]) * (m.FCR_max_factor / 3600.0)
         return m.SOC_FTM[s, t] >= fcr_floor
     model.Min_SOC_FTM = Constraint(model.S, model.T, rule=min_soc_ftm)
     
@@ -692,7 +690,7 @@ def build_multi_battery_model(
     def soh_update(m, s, t):
         total_power = (m.P_ch_BTM[s, t] + m.P_dis_BTM[s, t] + 
                        m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t])
-        return m.SOH[s, t+1] == m.SOH[s, t] - (m.a + m.b * total_power / m.V_bat[s] + m.c * m.SOH[s, t]) * m.delta_t * 3600
+        return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c * m.SOH[s, t]) * m.delta_t * 3600
     model.SOH_Update = Constraint(model.S, model.Tstep, rule=soh_update)
     
     # ==========================================================================
@@ -734,7 +732,7 @@ def build_multi_battery_model(
         )
         
         # FCR revenue (aggregated - payment is per MW bid)
-        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] * m.delta_t for t in m.T)
+        fcr_revenue = sum(m.C_FCR[t] * m.P_FCR_total[t] for t in m.T)
         
         return energy_cost + peak_cost + deg_cost - fcr_revenue
     
@@ -997,38 +995,7 @@ if __name__ == "__main__":
     C_peak = C_peak_annual * (simulation_days / 365.0)
     print(f"   Peak tariff prorated: €{C_peak_annual:.2f}/kW/year → €{C_peak:.2f}/kW for {simulation_days:.1f} days")
     
-<<<<<<< HEAD
-    ### Scenarios
-
-    btm_ratio = [0,0.2,0.4,0.6,0.8,1]
-    scaler_input = [0.2, 0.5, 1, 1.5, 5]
-
-    C_peak = 192.66
-    
-    OPTIMIZATION_HORIZON_DAYS = 28  # Set to None for full year
-    
-    if OPTIMIZATION_HORIZON_DAYS is not None:
-        T_horizon = min(OPTIMIZATION_HORIZON_DAYS * 24 * 4 - 1, data_full['T'])
-        print(f"\n🕐 Using {OPTIMIZATION_HORIZON_DAYS}-day horizon ({T_horizon+1} steps)")
-        
-        data = {
-            'day_ahead': data_full['day_ahead'][:T_horizon+1],
-            'fcr_prices': data_full['fcr_prices'][:T_horizon+1],
-            'site_loads': {k: v[:T_horizon+1] for k, v in data_full['site_loads'].items()},
-            'T': T_horizon,
-            'num_steps': T_horizon + 1,
-            'time_index': data_full['time_index'][:T_horizon+1],
-            'scale_factors': data_full['scale_factors']
-        }
-        C_peak *= data['T']/(366*24*60*4)
-    else:
-        data = data_full
-        print(f"\n🕐 Using full year ({data['T']+1} steps)")
-    
-    # Generate FCR activation profile
-=======
     # Load FCR activation profile for the same date range
->>>>>>> 55d564a (feat: Separate model execution from dashboard generation)
     delta_t = 0.25
     fcr_up, fcr_down = load_fcr_activation_profile(
         data_dir=this_file,
