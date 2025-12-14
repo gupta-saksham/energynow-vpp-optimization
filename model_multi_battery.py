@@ -162,7 +162,7 @@ def load_multi_site_data(
     }
 
 def load_fcr_activation_profile(data_dir: Path):
-    fcr_profile_df = pd.read_csv(data_dir / "dynamic_frequ_factor_FCR_2024_15min.csv", sep=",")
+    fcr_profile_df = pd.read_csv(data_dir / "FCR_Energy_2024_15min.csv", sep=",")
     fcr_up = fcr_profile_df["FCR_Power_Factor_Up_Sum"]
     fcr_down = fcr_profile_df["FCR_Power_Factor_Down_Sum"]
     return fcr_up, fcr_down
@@ -824,9 +824,9 @@ if __name__ == "__main__":
     btm_ratio = [0,0.2,0.4,0.6,0.8,1]
     scaler_input = [0.2, 0.5, 1, 1.5, 5]
 
-    C_peak = 192.66 * data_full['T']/(366*24*60*4)
+    C_peak = 192.66
 
-    OPTIMIZATION_HORIZON_DAYS = 7  # Set to None for full year
+    OPTIMIZATION_HORIZON_DAYS = 28  # Set to None for full year
     
     if OPTIMIZATION_HORIZON_DAYS is not None:
         T_horizon = min(OPTIMIZATION_HORIZON_DAYS * 24 * 4 - 1, data_full['T'])
@@ -841,6 +841,7 @@ if __name__ == "__main__":
             'time_index': data_full['time_index'][:T_horizon+1],
             'scale_factors': data_full['scale_factors']
         }
+        C_peak *= data['T']/(366*24*60*4)
     else:
         data = data_full
         print(f"\n🕐 Using full year ({data['T']+1} steps)")
