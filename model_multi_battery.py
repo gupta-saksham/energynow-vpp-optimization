@@ -49,7 +49,7 @@ LUNA_2000_215 = BatterySpec(
     eta_ch=0.974,
     eta_dis=0.974,
     I0=73000.0,
-    V_bat=777.0
+    V_bat=0.777
 )
 
 # =============================================================================
@@ -621,6 +621,7 @@ def build_multi_battery_model(
     model.Power_Balance_BTM = Constraint(model.S, model.T, rule=power_balance_BTM)
 
     def power_balance_FTM(m, s, t):
+
         return m.P_ch_FTM[s, t] + m.P_sell[s, t] == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
     model.Power_Balance_FTM = Constraint(model.S, model.T, rule=power_balance_FTM)
     
@@ -699,8 +700,10 @@ def build_multi_battery_model(
     # ==========================================================================
     
     def soh_update(m, s, t):
+        fcr_activation_fraction = abs(m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 3600.0
+        fcr_avg_power = m.P_FCR_bid[s, t] * fcr_activation_fraction  # kW (can be negative)
         total_power = (m.P_ch_BTM[s, t] + m.P_dis_BTM[s, t] + 
-                       m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t])
+                       m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t] + fcr_avg_power)
         return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c *(m.SOC_BTM[s, t] + m.SOC_FTM[s,t])/m.E_bat_max[s]) * m.delta_t * 3600
     model.SOH_Update = Constraint(model.S, model.Tstep, rule=soh_update)
     
@@ -956,9 +959,9 @@ if __name__ == "__main__":
                 eta_ch=0.974,      # Round-trip efficiency split
                 eta_dis=0.974,
                 I0=73000.0,        # Investment cost EUR
-                V_bat=777.0        # Nominal voltage
+                V_bat=0.777        # Nominal voltage
             ),
-            btm_ratio=0.2,         # 40% BTM (local load), 60% FTM (FCR)
+            btm_ratio=1,         # 40% BTM (local load), 60% FTM (FCR)
             P_buy_max=2000.0,       # Max grid import kW
             P_sell_max=2000.0       # Max grid export kW
         ))
