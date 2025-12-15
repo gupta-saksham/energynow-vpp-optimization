@@ -1372,7 +1372,7 @@ if __name__ == "__main__":
     # Specify the simulation period (YYYY-MM-DD format)
     
     START_DATE = "2024-01-01"   # Start date
-    END_DATE = "2024-01-07"     # End date (1 week for testing)
+    END_DATE = "2024-12-31"     # End date (1 week for testing)
     
     # For longer periods:
     # START_DATE = "2024-01-01"
@@ -1387,7 +1387,7 @@ if __name__ == "__main__":
     # =========================================================================
     
     # Reduced set for initial testing - avoiding edge cases (0.0 and 1.0 btm_ratio)
-    BTM_RATIOS = [0.4,0.8]  # Skip 0.0 and 1.0 edge cases
+    BTM_RATIOS = [0.2,0.5,0.8]  # Skip 0.0 and 1.0 edge cases
     SCALER_INPUTS = [1.0]              # Single scaler for quick test
     
     # Full set (uncomment when ready):
