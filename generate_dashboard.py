@@ -123,7 +123,7 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     print("  📊 multi_battery_dashboard.html")
     print("  📄 site_comparison_report.csv")
     if len(site_configs) > 0:
-        print(f"  📈 dashboard_{site_configs[0].name}.html")
+        print(f"  📈 dashboard_{site_configs[0].site_id}.html")
     
     return True
 
