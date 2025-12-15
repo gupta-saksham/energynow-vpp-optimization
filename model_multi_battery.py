@@ -350,7 +350,7 @@ def build_multi_battery_model(
     delta_t: float = 0.25,
     SOC0: float = 0.5,
     SOH0: float = 1.0,
-    C_peak: float = 192.66 / 1000,     # EUR/kW peak tariff
+    C_peak: float = 192.66,     # EUR/kW peak tariff
     min_fcr_bid: float = 1000.0, # 1 MW minimum FCR bid
     # SOH degradation parameters (small values for linear approximation)
     a: float = 1e-11,
@@ -890,7 +890,7 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
         
         # E. Degradation Cost
-        SOH_EOL = 0.8
+        SOH_EOL = 0.6
         soh_start = site_df['SOH'].iloc[0]
         soh_end = site_df['SOH'].iloc[-1]
         deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - SOH_EOL)
@@ -1001,7 +1001,7 @@ if __name__ == "__main__":
     END_DATE = "2024-01-07"     # End date - 1 week test
     
     # Peak tariff (EUR/kW/year) - will be prorated for simulation period
-    C_peak_annual = 192.66 / 1000
+    C_peak_annual = 192.66
     
     # =========================================================================
     # LOAD DATA WITH DATE RANGE
