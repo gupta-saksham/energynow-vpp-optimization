@@ -701,7 +701,7 @@ def build_multi_battery_model(
     def soh_update(m, s, t):
         total_power = (m.P_ch_BTM[s, t] + m.P_dis_BTM[s, t] + 
                        m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t])
-        return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c * m.SOH[s, t]) * m.delta_t * 3600
+        return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c *(m.SOC_BTM[s, t] + m.SOC_FTM[s,t])/m.E_bat_max[s]) * m.delta_t * 3600
     model.SOH_Update = Constraint(model.S, model.Tstep, rule=soh_update)
     
     # ==========================================================================
@@ -958,7 +958,7 @@ if __name__ == "__main__":
                 I0=73000.0,        # Investment cost EUR
                 V_bat=777.0        # Nominal voltage
             ),
-            btm_ratio=0.4,         # 40% BTM (local load), 60% FTM (FCR)
+            btm_ratio=0.2,         # 40% BTM (local load), 60% FTM (FCR)
             P_buy_max=2000.0,       # Max grid import kW
             P_sell_max=2000.0       # Max grid export kW
         ))
