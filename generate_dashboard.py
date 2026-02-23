@@ -26,12 +26,12 @@ import argparse
 from pathlib import Path
 import sys
 
-this_file = Path(__file__).parent
+from lib.paths import OUTPUTS_DIR
 
 
 def list_available_results():
     """List all saved results files."""
-    from results_io import list_saved_results
+    from lib.results_io import list_saved_results
     
     print("\n" + "="*70)
     print("AVAILABLE SAVED RESULTS")
@@ -56,8 +56,8 @@ def list_available_results():
 
 def generate_optimization_dashboard(filepath: str = None, output_dir: Path = None):
     """Generate dashboard from single optimization results."""
-    from results_io import load_optimization_results, get_latest_results
-    from dashboard_multi_battery import (
+    from lib.results_io import load_optimization_results, get_latest_results
+    from lib.dashboard_multi_battery import (
         create_multi_battery_dashboard,
         create_detailed_site_dashboard,
         print_financial_summary,
@@ -83,7 +83,7 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     
     # Setup output directory
     if output_dir is None:
-        output_dir = this_file
+        output_dir = OUTPUTS_DIR
     
     # Generate dashboards
     print("\n" + "="*70)
@@ -119,7 +119,7 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     print("\n" + "="*70)
     print("✓ DASHBOARDS GENERATED!")
     print("="*70)
-    print("\nFiles created:")
+    print("\nFiles created in outputs/:")
     print("  📊 multi_battery_dashboard.html")
     print("  📄 site_comparison_report.csv")
     if len(site_configs) > 0:
@@ -130,7 +130,7 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
 
 def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     """Generate dashboards from scenario analysis results."""
-    from results_io import load_scenario_results, get_latest_results
+    from lib.results_io import load_scenario_results, get_latest_results
     from scenario_analysis import (
         create_scenario_comparison_dashboard,
         create_detailed_insights_report,
@@ -154,7 +154,7 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     
     # Setup output directory
     if output_dir is None:
-        output_dir = this_file / "scenario_outputs"
+        output_dir = OUTPUTS_DIR / "scenario_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Print summary
@@ -175,26 +175,26 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     print("\nCreating comparison dashboard...")
     create_scenario_comparison_dashboard(
         results_df,
-        output_file=this_file / "scenario_comparison_dashboard.html"
+        output_file=OUTPUTS_DIR / "scenario_comparison_dashboard.html"
     )
     
     print("\nCreating insights report...")
     create_detailed_insights_report(
         results_df,
-        output_file=this_file / "scenario_insights.html"
+        output_file=OUTPUTS_DIR / "scenario_insights.html"
     )
     
     print("\nCreating master navigation...")
     create_master_navigation(
         results_df,
         output_dir=output_dir,
-        output_file=this_file / "scenario_master.html"
+        output_file=OUTPUTS_DIR / "scenario_master.html"
     )
     
     print("\n" + "="*70)
     print("✓ SCENARIO DASHBOARDS GENERATED!")
     print("="*70)
-    print("\nFiles created:")
+    print("\nFiles created in outputs/:")
     print("  🌐 scenario_master.html - Start here!")
     print("  📊 scenario_comparison_dashboard.html")
     print("  📈 scenario_insights.html")

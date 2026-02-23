@@ -1,1 +1,24 @@
+# Virtual environment
 .venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+.eggs/
+*.egg-info/
+*.egg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated results and outputs
+results/*.pkl
+results/*.pkl.gz
+results/*.json
+outputs/

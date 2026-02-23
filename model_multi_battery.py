@@ -14,7 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-this_file = Path(__file__).parent
+from lib.paths import DATA_DIR, OUTPUTS_DIR
 
 # =============================================================================
 # DATA STRUCTURES
@@ -1011,7 +1011,7 @@ if __name__ == "__main__":
     # =========================================================================
     
     data = load_multi_site_data(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         site_configs=site_configs,
         scale_loads_to_battery=True,
         scaler_input=1.0,
@@ -1028,7 +1028,7 @@ if __name__ == "__main__":
     # Load FCR activation profile for the same date range
     delta_t = 0.25
     fcr_up, fcr_down = load_fcr_activation_profile(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         start_date=START_DATE,
         end_date=END_DATE
     )
@@ -1159,8 +1159,9 @@ if __name__ == "__main__":
     print(f"NET BENEFIT:           €{port['net_benefit']:,.2f}")
     
     # Save CSV results
-    df.to_csv(this_file / "multi_battery_results.csv", index=False)
-    print(f"\nResults saved to multi_battery_results.csv")
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUTPUTS_DIR / "multi_battery_results.csv", index=False)
+    print(f"\nResults saved to outputs/multi_battery_results.csv")
     
     # =========================================================================
     # SAVE RESULTS FOR LATER DASHBOARD GENERATION
@@ -1170,7 +1171,7 @@ if __name__ == "__main__":
     
     if SAVE_RESULTS:
         try:
-            from results_io import save_optimization_results
+            from lib.results_io import save_optimization_results
             
             results_package = {
                 'df': df,
@@ -1204,7 +1205,7 @@ if __name__ == "__main__":
         print("=" * 60)
         
         try:
-            from dashboard_multi_battery import (
+            from lib.dashboard_multi_battery import (
                 create_multi_battery_dashboard, 
                 create_detailed_site_dashboard,
                 print_financial_summary,
@@ -1218,14 +1219,14 @@ if __name__ == "__main__":
             print("\nCreating portfolio dashboard...")
             create_multi_battery_dashboard(
                 df, financials, site_configs, data, 
-                output_file=this_file / "multi_battery_dashboard.html"
+                output_file=OUTPUTS_DIR / "multi_battery_dashboard.html"
             )
             
             # Generate comparison report CSV
             print("\nGenerating comparison report...")
             generate_comparison_report(
                 df, financials, 
-                output_file=this_file / "site_comparison_report.csv"
+                output_file=OUTPUTS_DIR / "site_comparison_report.csv"
             )
             
             # Generate detailed dashboard for first site as example
@@ -1233,13 +1234,13 @@ if __name__ == "__main__":
             print(f"\nCreating detailed dashboard for {first_site}...")
             create_detailed_site_dashboard(
                 df, first_site, financials, site_configs[0],
-                output_file=this_file / f"dashboard_{first_site}.html"
+                output_file=OUTPUTS_DIR / f"dashboard_{first_site}.html"
             )
             
             print("\n✓ All dashboards generated successfully!")
-            print(f"  - multi_battery_dashboard.html (interactive portfolio view)")
-            print(f"  - site_comparison_report.csv (site-by-site metrics)")
-            print(f"  - dashboard_{first_site}.html (detailed site view)")
+            print(f"  - outputs/multi_battery_dashboard.html (interactive portfolio view)")
+            print(f"  - outputs/site_comparison_report.csv (site-by-site metrics)")
+            print(f"  - outputs/dashboard_{first_site}.html (detailed site view)")
             
         except ImportError as e:
             print(f"\n⚠️  Dashboard generation skipped: {e}")

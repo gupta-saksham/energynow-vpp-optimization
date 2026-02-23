@@ -29,7 +29,7 @@ from model_multi_battery import (
     build_multi_battery_model, extract_results, calculate_financials
 )
 
-this_file = Path(__file__).parent
+from lib.paths import DATA_DIR, OUTPUTS_DIR
 
 # =============================================================================
 # SCENARIO CONFIGURATION
@@ -145,7 +145,7 @@ def run_single_scenario(
     
     # Load data with scaler and date range
     data = load_multi_site_data(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         site_configs=site_configs,
         scale_loads_to_battery=True,
         scaler_input=scaler_input,
@@ -454,7 +454,7 @@ def run_all_scenarios(
     """
     
     # Import dashboard functions
-    from dashboard_multi_battery import create_multi_battery_dashboard
+    from lib.dashboard_multi_battery import create_multi_battery_dashboard
     
     # Pre-load base data to get date range info
     print("\nPre-loading base data...")
@@ -468,7 +468,7 @@ def run_all_scenarios(
     ) for cfg in site_configs_template]
     
     base_data = load_multi_site_data(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         site_configs=base_configs,
         scale_loads_to_battery=True,
         scaler_input=1.0,
@@ -493,13 +493,13 @@ def run_all_scenarios(
     
     # Create output directory
     if output_dir is None:
-        output_dir = this_file / "scenario_outputs"
-    output_dir.mkdir(exist_ok=True)
+        output_dir = OUTPUTS_DIR / "scenario_outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Load FCR activation profiles for the date range
     delta_t = 0.25
     fcr_signal_up, fcr_signal_down = load_fcr_activation_profile(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         start_date=start_date,
         end_date=end_date
     )
@@ -796,7 +796,7 @@ def create_master_navigation(
     
     # Save
     if output_file is None:
-        output_file = output_dir.parent / "scenario_master.html"
+        output_file = OUTPUTS_DIR / "scenario_master.html"
     
     with open(output_file, 'w') as f:
         f.write(html)
@@ -1424,7 +1424,7 @@ if __name__ == "__main__":
         ))
     
     # Output directory
-    output_dir = this_file / "scenario_outputs"
+    output_dir = OUTPUTS_DIR / "scenario_outputs"
     
     # Run all scenarios (generates individual dashboards automatically)
     results_df, scenario_data = run_all_scenarios(
@@ -1440,8 +1440,9 @@ if __name__ == "__main__":
     )
     
     # Save results CSV
-    results_df.to_csv(this_file / "scenario_results.csv", index=False)
-    print(f"\nResults saved to scenario_results.csv")
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(OUTPUTS_DIR / "scenario_results.csv", index=False)
+    print(f"\nResults saved to outputs/scenario_results.csv")
     
     # =========================================================================
     # SAVE RESULTS FOR LATER DASHBOARD GENERATION
@@ -1451,7 +1452,7 @@ if __name__ == "__main__":
     
     if SAVE_RESULTS:
         try:
-            from results_io import save_scenario_results
+            from lib.results_io import save_scenario_results
             
             # Build base_data info for saving
             base_data_info = {
@@ -1504,12 +1505,12 @@ if __name__ == "__main__":
         
         fig1 = create_scenario_comparison_dashboard(
             results_df,
-            output_file=this_file / "scenario_comparison_dashboard.html"
+            output_file=OUTPUTS_DIR / "scenario_comparison_dashboard.html"
         )
         
         fig2 = create_detailed_insights_report(
             results_df,
-            output_file=this_file / "scenario_insights.html"
+            output_file=OUTPUTS_DIR / "scenario_insights.html"
         )
         
         # Create master navigation page
@@ -1517,19 +1518,19 @@ if __name__ == "__main__":
         create_master_navigation(
             results_df,
             output_dir=output_dir,
-            output_file=this_file / "scenario_master.html"
+            output_file=OUTPUTS_DIR / "scenario_master.html"
         )
         
         print("\n" + "="*70)
         print("✓ SCENARIO ANALYSIS COMPLETE!")
         print("="*70)
         print("\nGenerated files:")
-        print(f"  📄 scenario_results.csv - Raw results data")
-        print(f"  🌐 scenario_master.html - MASTER NAVIGATION (start here!)")
-        print(f"  📊 scenario_comparison_dashboard.html - Comparison heatmaps")
-        print(f"  📈 scenario_insights.html - Detailed insights")
-        print(f"  📁 scenario_outputs/ - Individual scenario dashboards")
-        print(f"\nOpen scenario_master.html in your browser to navigate all results!")
+        print(f"  📄 outputs/scenario_results.csv - Raw results data")
+        print(f"  🌐 outputs/scenario_master.html - MASTER NAVIGATION (start here!)")
+        print(f"  📊 outputs/scenario_comparison_dashboard.html - Comparison heatmaps")
+        print(f"  📈 outputs/scenario_insights.html - Detailed insights")
+        print(f"  📁 outputs/scenario_outputs/ - Individual scenario dashboards")
+        print(f"\nOpen outputs/scenario_master.html in your browser to navigate all results!")
     else:
         print("\n⚠️  Dashboard generation skipped (GENERATE_DASHBOARDS = False)")
         print("   Run: python generate_dashboard.py --scenarios to create dashboards from saved results")
