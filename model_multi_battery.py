@@ -109,6 +109,7 @@ def filter_data_by_date_range(
     # Filter all data arrays
     filtered_data = {
         'day_ahead': data['day_ahead'][start_idx:end_idx],
+        'day_ahead_forecast': data['day_ahead_forecast'][start_idx:end_idx],
         'industrial_tarifs': data['industrial_tarifs'][start_idx:end_idx],
         'fcr_prices': data['fcr_prices'][start_idx:end_idx],
         'site_loads': {k: v[start_idx:end_idx] for k, v in data['site_loads'].items()},
@@ -126,7 +127,6 @@ def filter_data_by_date_range(
     print(f"   Timesteps: {filtered_data['num_steps']} ({filtered_data['num_steps'] / 96:.1f} days)")
     
     return filtered_data
-
 
 def load_multi_site_data(
     data_dir: Path,
@@ -176,6 +176,7 @@ def load_multi_site_data(
     
     # Convert EUR/MWh to EUR/kWh
     day_ahead = day_ahead_df["Germany/Luxembourg [Eur/MWh]"] / 1000.0
+    day_ahead_forecast = day_ahead_df["Forecasted prices [Eur/MWh]"] / 1000.0
 
     # Load industrial tarifs
     industrial_tarifs_df = pd.read_csv(data_dir / "industrial_tarrifs.csv")
@@ -251,6 +252,7 @@ def load_multi_site_data(
     
     full_data = {
         'day_ahead': day_ahead.values,
+        'day_ahead_forecast': day_ahead_forecast.values,
         'industrial_tarifs': tarifs_year.values,
         'fcr_prices': fcr_prices_normalized.values,
         'site_loads': site_loads,
@@ -355,7 +357,8 @@ def build_multi_battery_model(
     # SOH degradation parameters (small values for linear approximation)
     a: float = 1e-11,
     b: float = 1e-11,
-    c: float = 1e-10
+    c: float = 1e-10,
+    forecast_day_ahead : bool = False
 ) -> ConcreteModel:
     """
     Build multi-site VPP optimization model.
@@ -371,8 +374,12 @@ def build_multi_battery_model(
     
     T = data['T']
     C_buy_BTM = data['industrial_tarifs']
-    C_buy_FTM = data['day_ahead']
-    C_sell = data['day_ahead']  # Symmetric pricing
+    index_string = 'day_ahead'
+    if forecast_day_ahead:
+        index_string += '_forecast'
+    C_buy_FTM = data[index_string]
+    C_sell = data[index_string]  # Symmetric pricing
+
     C_FCR = data['fcr_prices']
     site_loads = data['site_loads']
     
@@ -789,7 +796,7 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             soh = value(model.SOH[s, t])
             
             # Market data
-            price = value(model.C_buy_FTM[t])
+            price = data["day_ahead"][t]
             industrial_price = value(model.C_buy_BTM[t])
             fcr_price = value(model.C_FCR[t])
             demand = value(model.D[s, t])
@@ -940,6 +947,7 @@ if __name__ == "__main__":
     # CONFIGURATION: Define sites
     # =========================================================================
     
+    btm_ratio = 0.5
     # Create site configurations (using different load profiles)
     # We need 16 batteries to reach >1 MW aggregated FTM capacity
     # 16 * 108 kW * 0.6 FTM = 1036.8 kW > 1 MW minimum FCR bid
@@ -961,7 +969,7 @@ if __name__ == "__main__":
                 I0=73000.0,        # Investment cost EUR
                 V_bat=0.777        # Nominal voltage
             ),
-            btm_ratio=1,         # 40% BTM (local load), 60% FTM (FCR)
+            btm_ratio=btm_ratio,         # 40% BTM (local load), 60% FTM (FCR)
             P_buy_max=2000.0,       # Max grid import kW
             P_sell_max=2000.0       # Max grid export kW
         ))
@@ -1018,7 +1026,6 @@ if __name__ == "__main__":
         start_date=START_DATE,
         end_date=END_DATE
     )
-
     # Prorate peak tariff based on simulation period
     # (Peak charges are typically annual, so we scale for shorter periods)
     simulation_days = data['num_steps'] / 96  # 96 steps per day
@@ -1060,6 +1067,7 @@ if __name__ == "__main__":
         SOH0=1.0,
         C_peak=C_peak,
         min_fcr_bid=1000.0,  # 1 MW
+        forecast_day_ahead=True
     )
     
     # Count model components
