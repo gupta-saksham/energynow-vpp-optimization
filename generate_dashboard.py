@@ -80,6 +80,7 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     
     df = results['df']
     financials = results['financials']
+    C_peak = metadata.get('C_peak', None) if metadata else None
     
     # Setup output directory
     if output_dir is None:
@@ -97,7 +98,8 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     print("\nCreating portfolio dashboard...")
     create_multi_battery_dashboard(
         df, financials, site_configs, data,
-        output_file=output_dir / "multi_battery_dashboard.html"
+        output_file=output_dir / "multi_battery_dashboard.html",
+        C_peak=C_peak,
     )
     
     # Comparison report

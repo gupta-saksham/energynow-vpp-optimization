@@ -157,7 +157,8 @@ def create_multi_battery_dashboard(
     site_configs: List,
     data: Dict,
     output_file: Path = None,
-    delta_t: float = 0.25
+    delta_t: float = 0.25,
+    C_peak: float = None,
 ) -> go.Figure:
     """
     Create comprehensive multi-battery VPP dashboard with proper subplots.
@@ -212,8 +213,16 @@ def create_multi_battery_dashboard(
     # 2. DA Arbitrage: Revenue Sell - Cost Buy FTM
     agg_df['val_da_arb'] = (agg_df['P_sell'] * agg_df['Price'] - agg_df['P_ch_FTM'] * agg_df['Price']) * delta_t
     
-    # 3. FCR Revenue
-    agg_df['val_fcr'] = agg_df['FCR_total'] * agg_df['FCR_price'] * delta_t
+    # 3. FCR Revenue (FCR price is already EUR/kW per step — no delta_t)
+    agg_df['val_fcr'] = agg_df['FCR_total'] * agg_df['FCR_price']
+
+    # Reconciliation: dashboard FCR sum should match calculate_financials
+    _fcr_dashboard = agg_df['val_fcr'].sum()
+    _fcr_financials = financials['portfolio']['fcr_revenue']
+    if abs(_fcr_dashboard - _fcr_financials) > max(1.0, 0.01 * abs(_fcr_financials)):
+        print(f"⚠  FCR reconciliation: dashboard sum €{_fcr_dashboard:,.2f} "
+              f"vs financials €{_fcr_financials:,.2f} "
+              f"(diff €{_fcr_dashboard - _fcr_financials:,.2f})")
 
     # ==========================================================================
     # CREATE SUBPLOT FIGURE
@@ -441,9 +450,6 @@ def create_multi_battery_dashboard(
     # Ensure datetime is index
     agg_df['datetime_idx'] = pd.to_datetime(agg_df['datetime'])
     
-    # Yearly Peak Tariff (approximate monthly attribution)
-    C_PEAK_ANNUAL = 192.66 
-    
     # Pre-calculate BTM Charging Cost for Net Load Shifting
     agg_df['val_btm_cost'] = agg_df['P_ch_BTM'] * agg_df['Price industrial'] * delta_t
     
@@ -451,29 +457,36 @@ def create_multi_battery_dashboard(
     monthly_energy = agg_df.set_index('datetime_idx')[['val_btm_savings', 'val_da_arb', 'val_fcr', 'val_btm_cost']].resample('ME').sum()
     
     # Calculate Net Load Shifting (Gross Savings - Charging Cost)
-    # Note: val_btm_savings from agg_df was P_dis * Price * dt
-    # We subtract val_btm_cost (P_ch * Price * dt)
     monthly_energy['val_load_shifting'] = monthly_energy['val_btm_savings'] - monthly_energy['val_btm_cost']
     
-    # 2. Resample Max for Peak Savings
-    monthly_peaks = agg_df.set_index('datetime_idx')[['demand', 'P_buy']].resample('ME').max()
-    
-    # Calculate Monthly Peak Savings
-    # Assumption: Peak savings are valued at 1/12th of annual tariff per month for visualization
-    monthly_peaks['val_peak_savings'] = (monthly_peaks['demand'] - monthly_peaks['P_buy']) * (C_PEAK_ANNUAL / 12.0)
+    # 2. Peak savings: allocate portfolio peak_savings proportionally by
+    #    timesteps per calendar month so bars sum to the model's figure.
+    portfolio_peak_savings = financials['portfolio']['peak_savings']
+    monthly_step_counts = agg_df.set_index('datetime_idx').resample('ME').size()
+    total_steps = monthly_step_counts.sum()
+    monthly_peak_alloc = pd.DataFrame(index=monthly_step_counts.index)
+    if total_steps > 0:
+        monthly_peak_alloc['val_peak_savings'] = (
+            monthly_step_counts / total_steps * portfolio_peak_savings
+        )
+    else:
+        monthly_peak_alloc['val_peak_savings'] = 0.0
     
     # Merge
-    monthly_df = pd.concat([monthly_energy, monthly_peaks], axis=1)
+    monthly_df = pd.concat([monthly_energy, monthly_peak_alloc], axis=1)
     monthly_df['month_name'] = monthly_df.index.strftime('%B %Y')
     
     # Plot Stacked Bars - DETAILED REVENUE ATTRIBUTION
     
-    # 1. Peak Shaving
+    # 1. Peak Shaving (prorated to simulation length, reconciled with model)
+    _peak_label = 'Peak Shaving (prorated)'
+    if C_peak is not None:
+        _peak_label += f' — C_peak €{C_peak:.2f}/kW'
     fig.add_trace(go.Bar(
         x=monthly_df['month_name'], y=monthly_df['val_peak_savings'],
-        name='Peak Shaving',
+        name=_peak_label,
         marker_color=COLORS['peak'],
-        hovertemplate='Peak Shaving: €%{y:,.0f}<extra>Reduced max grid load</extra>'
+        hovertemplate='Peak Shaving: €%{y:,.2f}<extra>Prorated to simulation horizon</extra>'
     ), row=6, col=1)
 
     # 2. Load Shifting (Net)
@@ -499,8 +512,6 @@ def create_multi_battery_dashboard(
         marker_color=COLORS['fcr'],
         hovertemplate='FCR Revenue: €%{y:,.0f}<extra>Frequency support</extra>'
     ), row=6, col=1)
-    
-    # Note: Peak savings not shown as they are annual/difficult to attribute monthly
     
     # ==========================================================================
     # LAYOUT
