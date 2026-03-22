@@ -358,7 +358,9 @@ def build_multi_battery_model(
     a: float = 1e-11,
     b: float = 1e-11,
     c: float = 1e-10,
-    forecast_day_ahead : bool = False
+    forecast_day_ahead: bool = False,
+    daily_cycle_limit: Optional[float] = 2.0,
+    force_disable_fcr: bool = False,
 ) -> ConcreteModel:
     """
     Build multi-site VPP optimization model.
@@ -368,6 +370,13 @@ def build_multi_battery_model(
     - FTM partitions are aggregated for FCR bidding
     - 1 MW minimum FCR bid constraint
     - Per-site peak tracking and grid exchange
+    
+    Daily cycle cap (direction-agnostic, all scheduled legs):
+    - daily_cycle_limit: max full round-trips per day per site.
+      One cycle = one full round-trip (charge E + discharge E).
+      The constraint sums P_ch_BTM + P_ch_FTM + P_dis_BTM + P_dis_FTM
+      and caps at daily_cycle_limit * 2 * E_bat_max (since one round-trip
+      moves 2E through the battery).  Set to None to disable.
     """
     
     model = ConcreteModel(name="Multi-Battery VPP")
@@ -498,8 +507,9 @@ def build_multi_battery_model(
     model.P_FCR_bid = Var(model.S, model.T, within=NonNegativeReals, bounds=ftm_power_bounds)
     
     # Grid exchange per site
+    # P_buy_BTM must always be large enough to cover demand even when btm_ratio=0
     def P_buy_BTM_bounds(m, s, t):
-        return (0, m.P_buy_max[s] * m.btm_ratio[s])
+        return (0, m.P_buy_max[s])
     model.P_buy_BTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_BTM_bounds)
 
     def P_buy_FTM_bounds(m, s, t):
@@ -702,6 +712,12 @@ def build_multi_battery_model(
         return m.P_FCR_bid[s, t] == m.P_FCR_bid[s, t-1]
     model.FCR_Site_Block = Constraint(model.S, model.T, rule=fcr_site_block_consistency)
     
+    # Completely disable FCR when requested (overrides capacity-based logic)
+    if force_disable_fcr:
+        def fcr_force_zero(m, t):
+            return m.P_FCR_total[t] == 0
+        model.FCR_Force_Zero = Constraint(model.T, rule=fcr_force_zero)
+    
     # ==========================================================================
     # CONSTRAINTS - SOH Degradation
     # ==========================================================================
@@ -715,22 +731,27 @@ def build_multi_battery_model(
     model.SOH_Update = Constraint(model.S, model.Tstep, rule=soh_update)
     
     # ==========================================================================
-    # CONSTRAINTS - Daily Cycle Limit (Optional: 2 full cycles/day)
+    # CONSTRAINTS - Daily Cycle Limit (configurable or disabled via None)
+    # One cycle = one full round-trip = 2 * E_bat_max of throughput.
     # ==========================================================================
     
     steps_per_day = int(24 / delta_t)
     num_days = int((T + 1) // steps_per_day)
     model.Days = RangeSet(0, max(0, num_days - 1))
     
-    def daily_cycle_limit(m, s, d):
-        start_t = d * steps_per_day
-        end_t = min(start_t + steps_per_day - 1, T)
-        daily_discharge = sum(
-            (m.P_dis_BTM[s, t] + m.P_dis_FTM[s, t]) * m.delta_t
-            for t in range(start_t, end_t + 1)
-        )
-        return daily_discharge <= 2.0 * m.E_bat_max[s]
-    model.Daily_Cycle_Limit = Constraint(model.S, model.Days, rule=daily_cycle_limit)
+    if daily_cycle_limit is not None and daily_cycle_limit > 0:
+        _cycle_limit = float(daily_cycle_limit)
+        
+        def daily_cycle_limit_rule(m, s, d):
+            start_t = d * steps_per_day
+            end_t = min(start_t + steps_per_day - 1, T)
+            daily_throughput = sum(
+                (m.P_ch_BTM[s, t] + m.P_ch_FTM[s, t]
+                 + m.P_dis_BTM[s, t] + m.P_dis_FTM[s, t]) * m.delta_t
+                for t in range(start_t, end_t + 1)
+            )
+            return daily_throughput <= _cycle_limit * 2 * m.E_bat_max[s]
+        model.Daily_Cycle_Limit = Constraint(model.S, model.Days, rule=daily_cycle_limit_rule)
     
     # ==========================================================================
     # OBJECTIVE
@@ -766,6 +787,15 @@ def build_multi_battery_model(
 # RESULTS EXTRACTION
 # =============================================================================
 
+def _safe_value(var, default=0.0):
+    """Return the numeric value of a Pyomo variable, or *default* if uninitialised."""
+    try:
+        v = value(var)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
 def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.DataFrame:
     """Extract optimization results into a DataFrame for analysis."""
     
@@ -777,23 +807,23 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
         for s in site_ids:
             cfg = site_config_map[s]
             
-            # Power flows
-            p_ch_btm = value(model.P_ch_BTM[s, t])
-            p_dis_btm = value(model.P_dis_BTM[s, t])
-            p_ch_ftm = value(model.P_ch_FTM[s, t])
-            p_dis_ftm = value(model.P_dis_FTM[s, t])
-            p_fcr_bid = value(model.P_FCR_bid[s, t])
+            # Power flows (safe extraction handles edge cases like btm_ratio=0/1)
+            p_ch_btm = _safe_value(model.P_ch_BTM[s, t])
+            p_dis_btm = _safe_value(model.P_dis_BTM[s, t])
+            p_ch_ftm = _safe_value(model.P_ch_FTM[s, t])
+            p_dis_ftm = _safe_value(model.P_dis_FTM[s, t])
+            p_fcr_bid = _safe_value(model.P_FCR_bid[s, t])
             
             # Grid exchange
-            p_buy = value(model.P_buy_FTM[s, t]) + value(model.P_buy_BTM[s, t])
-            p_buy_btm = value(model.P_buy_BTM[s, t])
-            p_buy_ftm = value(model.P_buy_FTM[s, t])
-            p_sell = value(model.P_sell[s, t])
+            p_buy = _safe_value(model.P_buy_FTM[s, t]) + _safe_value(model.P_buy_BTM[s, t])
+            p_buy_btm = _safe_value(model.P_buy_BTM[s, t])
+            p_buy_ftm = _safe_value(model.P_buy_FTM[s, t])
+            p_sell = _safe_value(model.P_sell[s, t])
             
             # State
-            soc_btm = value(model.SOC_BTM[s, t])
-            soc_ftm = value(model.SOC_FTM[s, t])
-            soh = value(model.SOH[s, t])
+            soc_btm = _safe_value(model.SOC_BTM[s, t])
+            soc_ftm = _safe_value(model.SOC_FTM[s, t])
+            soh = _safe_value(model.SOH[s, t], default=1.0)
             
             # Market data
             price = data["day_ahead"][t]
@@ -802,8 +832,8 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
             demand = value(model.D[s, t])
             
             # Aggregated FCR
-            fcr_total = value(model.P_FCR_total[t])
-            u_fcr = value(model.u_FCR[t])
+            fcr_total = _safe_value(model.P_FCR_total[t])
+            u_fcr = _safe_value(model.u_FCR[t])
             fcr_signal = value(model.FCR_signal_up[t]) - value(model.FCR_signal_down[t]) 
             
             records.append({
@@ -1227,7 +1257,8 @@ if __name__ == "__main__":
             print("\nCreating portfolio dashboard...")
             create_multi_battery_dashboard(
                 df, financials, site_configs, data, 
-                output_file=OUTPUTS_DIR / "multi_battery_dashboard.html"
+                output_file=OUTPUTS_DIR / "multi_battery_dashboard.html",
+                C_peak=C_peak,
             )
             
             # Generate comparison report CSV
