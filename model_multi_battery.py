@@ -638,7 +638,6 @@ def build_multi_battery_model(
     model.Power_Balance_BTM = Constraint(model.S, model.T, rule=power_balance_BTM)
 
     def power_balance_FTM(m, s, t):
-
         return m.P_ch_FTM[s, t] + m.P_sell[s, t] == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
     model.Power_Balance_FTM = Constraint(model.S, model.T, rule=power_balance_FTM)
     
@@ -675,7 +674,22 @@ def build_multi_battery_model(
     # Total FCR bid is sum of all site contributions
     def fcr_total_def(m, t):
         return m.P_FCR_total[t] == sum(m.P_FCR_bid[s, t] for s in m.S)
-    model.FCR_Total_Def = Constraint(model.T, rule=fcr_total_def)
+    model.FCR_Total_Def = Constraint( model.T, rule=fcr_total_def)
+    
+    def fcr_ch_power_limit(m, s, t):
+        return m.P_ch_FTM[s,t] <= m.P_bat_max[s]*(1-m.btm_ratio[s]) - m.P_FCR_bid[s,t]
+    
+    model.FCR_ch_power_limit = Constraint(model.S, model.T, rule=fcr_ch_power_limit)
+    
+    def fcr_dis_power_limit(m, s, t):
+        return m.P_dis_FTM[s,t] <= m.P_bat_max[s]*(1-m.btm_ratio[s]) - m.P_FCR_bid[s,t]
+    
+    model.FCR_dis_power_limit = Constraint(model.S, model.T, rule=fcr_dis_power_limit)
+
+    def fcr_ch_power_headroom(m, s, t):
+        return m.P_ch_FTM[s,t] >= m.P_FCR_bid[s,t]
+    
+    model.FCR_ch_power_headroom = Constraint(model.S, model.T, rule=fcr_ch_power_headroom)
     
     # If participating in FCR, must bid at least 1 MW
     def fcr_min_bid(m, t):
@@ -977,7 +991,7 @@ if __name__ == "__main__":
     # CONFIGURATION: Define sites
     # =========================================================================
     
-    btm_ratio = 0.5
+    btm_ratio = 0.8
     # Create site configurations (using different load profiles)
     # We need 16 batteries to reach >1 MW aggregated FTM capacity
     # 16 * 108 kW * 0.6 FTM = 1036.8 kW > 1 MW minimum FCR bid
