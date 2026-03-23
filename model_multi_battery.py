@@ -638,7 +638,8 @@ def build_multi_battery_model(
     model.Power_Balance_BTM = Constraint(model.S, model.T, rule=power_balance_BTM)
 
     def power_balance_FTM(m, s, t):
-        return m.P_ch_FTM[s, t] + m.P_sell[s, t] == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
+        fcr_activation = m.P_FCR_bid[s, t] * (m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 3600.0
+        return m.P_ch_FTM[s, t] + m.P_sell[s, t] + fcr_activation == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
     model.Power_Balance_FTM = Constraint(model.S, model.T, rule=power_balance_FTM)
     
     # Buy/Sell exclusivity
@@ -686,11 +687,6 @@ def build_multi_battery_model(
     
     model.FCR_dis_power_limit = Constraint(model.S, model.T, rule=fcr_dis_power_limit)
 
-    def fcr_ch_power_headroom(m, s, t):
-        return m.P_ch_FTM[s,t] >= m.P_FCR_bid[s,t]
-    
-    model.FCR_ch_power_headroom = Constraint(model.S, model.T, rule=fcr_ch_power_headroom)
-    
     # If participating in FCR, must bid at least 1 MW
     def fcr_min_bid(m, t):
         return m.P_FCR_total[t] >= m.u_FCR[t] * m.min_fcr_bid
