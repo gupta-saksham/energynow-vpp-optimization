@@ -75,13 +75,13 @@ SCENARIO_DEFS: List[ScenarioConfig] = [
         daily_cycle_limit=2.0,
     ),
     ScenarioConfig(
-        name="Full BTM",
-        btm_ratio=1.0, ftm_ratio=0.0,
+        name="80% BTM",
+        btm_ratio=0.8, ftm_ratio=0.2,
         daily_cycle_limit=2.0,
     ),
     ScenarioConfig(
-        name="Full FTM",
-        btm_ratio=0.0, ftm_ratio=1.0,
+        name="80% FTM",
+        btm_ratio=0.2, ftm_ratio=0.8,
         daily_cycle_limit=2.0,
     ),
     ScenarioConfig(
@@ -158,6 +158,7 @@ class ScenarioResult:
     # Attribution (% of net benefit)
     pct_from_btm: float
     pct_from_peak: float
+    pct_from_da: float
     pct_from_fcr: float
     pct_from_export: float
     
@@ -183,7 +184,7 @@ def _empty_result(scenario: ScenarioConfig, solver_status: str, solve_time: floa
         self_consumption_rate=0, grid_dependency=0,
         avg_soc_btm=0, avg_soc_ftm=0, avg_fcr_bid=0, fcr_participation_rate=0,
         peak_demand=0, peak_import=0, peak_reduction_pct=0,
-        pct_from_btm=0, pct_from_peak=0, pct_from_fcr=0, pct_from_export=0,
+        pct_from_btm=0, pct_from_peak=0, pct_from_da=0, pct_from_fcr=0, pct_from_export=0,
         total_charge_kwh=0, total_discharge_kwh=0, equivalent_cycles=0, avg_power_utilization=0,
     )
 
@@ -380,14 +381,27 @@ def run_single_scenario(
         peak_reduction_pct = (1 - peak_import / max(peak_demand, 1)) * 100
 
         export_revenue = (agg['P_sell'] * data['day_ahead'][:len(agg)] * delta_t).sum()
+        day_ahead_arbitrage = (
+            port['net_benefit']
+            - port['btm_savings']
+            - port['peak_savings']
+            - port['fcr_revenue']
+            + port['degradation_cost']
+        )
 
-        total_value = abs(port['btm_savings']) + abs(port['peak_savings']) + abs(port['fcr_revenue'])
+        total_value = (
+            abs(port['btm_savings'])
+            + abs(port['peak_savings'])
+            + abs(day_ahead_arbitrage)
+            + abs(port['fcr_revenue'])
+        )
         if total_value > 0:
             pct_from_btm = abs(port['btm_savings']) / total_value * 100
             pct_from_peak = abs(port['peak_savings']) / total_value * 100
+            pct_from_da = abs(day_ahead_arbitrage) / total_value * 100
             pct_from_fcr = abs(port['fcr_revenue']) / total_value * 100
         else:
-            pct_from_btm = pct_from_peak = pct_from_fcr = 0
+            pct_from_btm = pct_from_peak = pct_from_da = pct_from_fcr = 0
         pct_from_export = export_revenue / max(total_value, 1) * 100 if total_value > 0 else 0
 
         equivalent_cycles = total_discharge_kwh / max(total_E_max, 1)
@@ -431,6 +445,7 @@ def run_single_scenario(
             peak_reduction_pct=peak_reduction_pct,
             pct_from_btm=pct_from_btm,
             pct_from_peak=pct_from_peak,
+            pct_from_da=pct_from_da,
             pct_from_fcr=pct_from_fcr,
             pct_from_export=pct_from_export,
             total_charge_kwh=total_charge_kwh,
@@ -598,23 +613,26 @@ def create_master_navigation(
     <title>VPP Scenario Analysis - Master Navigation</title>
     <style>
         :root {
-            --primary: #2c3e50;
-            --secondary: #3498db;
-            --success: #27ae60;
-            --warning: #f39c12;
-            --danger: #e74c3c;
-            --light: #ecf0f1;
-            --dark: #1a252f;
+            --primary: #23364d;
+            --secondary: #2f80ed;
+            --success: #1f9d6b;
+            --warning: #f2a43a;
+            --danger: #d9534f;
+            --light: #f3f6fb;
+            --dark: #15212f;
+            --card-bg: rgba(255,255,255,0.10);
+            --card-border: rgba(255,255,255,0.16);
         }
         
         * { box-sizing: border-box; margin: 0; padding: 0; }
         
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, var(--dark) 0%, var(--primary) 100%);
+            background: radial-gradient(1200px 400px at 20% -5%, rgba(47,128,237,0.30), transparent 50%),
+                        linear-gradient(140deg, var(--dark) 0%, var(--primary) 100%);
             min-height: 100vh;
             color: white;
-            padding: 20px;
+            padding: 26px;
         }
         
         .container { max-width: 1400px; margin: 0 auto; }
@@ -641,17 +659,18 @@ def create_master_navigation(
         }
         
         .nav-card {
-            background: rgba(255,255,255,0.1);
-            border-radius: 12px;
-            padding: 20px;
+            background: var(--card-bg);
+            border-radius: 14px;
+            padding: 22px;
             transition: all 0.3s ease;
-            border: 1px solid rgba(255,255,255,0.1);
+            border: 1px solid var(--card-border);
+            backdrop-filter: blur(4px);
         }
         
         .nav-card:hover {
-            transform: translateY(-5px);
-            background: rgba(255,255,255,0.15);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+            transform: translateY(-4px);
+            background: rgba(255,255,255,0.14);
+            box-shadow: 0 12px 32px rgba(0,0,0,0.25);
         }
         
         .nav-card h3 {
@@ -696,7 +715,7 @@ def create_master_navigation(
         .main-link {
             background: var(--secondary);
             color: white;
-            padding: 15px 30px;
+            padding: 14px 26px;
             border-radius: 8px;
             text-decoration: none;
             font-weight: bold;
@@ -741,8 +760,7 @@ def create_master_navigation(
         <p class="subtitle">Multi-Battery Virtual Power Plant Optimization Results</p>
         
         <div class="main-links">
-            <a href="scenario_comparison_dashboard.html" class="main-link highlight">📊 Comparison Dashboard</a>
-            <a href="scenario_insights.html" class="main-link">📈 Detailed Insights</a>
+            <a href="scenario_overview_dashboard.html" class="main-link highlight">📊 Scenario Overview</a>
             <a href="scenario_results.csv" class="main-link">📁 Download CSV</a>
         </div>
         
@@ -818,13 +836,13 @@ def create_master_navigation(
 # VISUALIZATION
 # =============================================================================
 
-def create_scenario_comparison_dashboard(
+def create_scenario_overview_dashboard(
     results_df: pd.DataFrame,
-    output_file: Path = None
+    output_file: Path = None,
+    scenario_data: Optional[Dict] = None,
 ) -> go.Figure:
     """
-    Create a comparison dashboard for named scenarios.
-    Uses bar charts keyed by scenario_name (not heatmaps).
+    Create one merged scenario overview dashboard (comparison + insights).
     """
 
     df = results_df[results_df['feasible']].copy()
@@ -834,52 +852,129 @@ def create_scenario_comparison_dashboard(
 
     name_col = 'scenario_name' if 'scenario_name' in df.columns else 'scenario_id'
     names = df[name_col].tolist()
+    df['value_per_cycle'] = df['net_benefit'] / df['equivalent_cycles'].replace(0, np.nan)
+    df['day_ahead_arbitrage'] = (
+        df['net_benefit']
+        - df['btm_savings']
+        - df['peak_savings']
+        - df['fcr_revenue']
+        + df['degradation_cost']
+    )
+    if 'pct_from_da' not in df.columns:
+        total_value = (
+            df['btm_savings'].abs()
+            + df['peak_savings'].abs()
+            + df['day_ahead_arbitrage'].abs()
+            + df['fcr_revenue'].abs()
+        )
+        total_value_safe = total_value.replace(0, np.nan)
+        df['pct_from_btm'] = 100 * df['btm_savings'].abs() / total_value_safe
+        df['pct_from_peak'] = 100 * df['peak_savings'].abs() / total_value_safe
+        df['pct_from_da'] = 100 * df['day_ahead_arbitrage'].abs() / total_value_safe
+        df['pct_from_fcr'] = 100 * df['fcr_revenue'].abs() / total_value_safe
+        df[['pct_from_btm', 'pct_from_peak', 'pct_from_da', 'pct_from_fcr']] = (
+            df[['pct_from_btm', 'pct_from_peak', 'pct_from_da', 'pct_from_fcr']].fillna(0.0)
+        )
+
+    target_btm = [0.2, 0.5, 0.8]  # Intended BTM ratios to compare
+    target_btm_title = "/".join([str(int(round(r * 100))) for r in target_btm])
 
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=6, cols=2,
         subplot_titles=(
             '<b>Net Benefit</b>',
             '<b>Value Attribution (%)</b>',
             '<b>Peak Reduction (%)</b>',
-            '<b>FCR Participation Rate (%)</b>',
-            '<b>Equivalent Battery Cycles</b>',
+            '<b>FCR Participation (%)</b>',
+            '<b>Financial Breakdown</b>',
+            '<b>Equivalent Cycles / Value per Cycle</b>',
+            '<b>SOC Mix (BTM/FTM) & Utilization</b>',
             '<b>Degradation Cost</b>',
+            '<b>Customers Savings / Month</b>',
+            f'<b>BTM Ratio Comparison ({target_btm_title})</b>',
+            '<b>Uncertain Prices vs Baseline (Cash Components)</b>',
+            '<b>No FCR vs Baseline (Cash Components)</b>',
         ),
-        vertical_spacing=0.12,
+        vertical_spacing=0.16,
         horizontal_spacing=0.12,
+        specs=[
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": True}],
+            [{"secondary_y": True}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}],
+            [{"secondary_y": False}, {"secondary_y": False}],
+        ],
     )
 
-    # 1 — Net benefit
+    def _cell_domains_paper(row: int, col: int):
+        """
+        Get (x_domain, y_domain) in paper coordinates for a subplot cell.
+        Relies on Plotly's internal _grid_ref mapping created by make_subplots.
+        """
+        grid_cell = fig._grid_ref[row - 1][col - 1]
+        # In this Plotly version, grid_cell is a 1-tuple containing a SubplotRef.
+        subplot_ref = grid_cell[0]
+        xaxis_name = subplot_ref.layout_keys[0]
+        yaxis_name = subplot_ref.layout_keys[1]
+        x_domain = getattr(fig.layout, xaxis_name).domain
+        y_domain = getattr(fig.layout, yaxis_name).domain
+        return x_domain, y_domain
+
+    def _add_local_legend(
+        row: int,
+        col: int,
+        items: List[Tuple[str, str]],
+        x_frac: float = 0.02,
+        y_frac_from_top: float = 0.04,
+    ):
+        # Place inside the subplot cell domain (paper coordinates).
+        x_domain, y_domain = _cell_domains_paper(row, col)
+        x0, x1 = x_domain
+        y0, y1 = y_domain
+        x = x0 + x_frac * (x1 - x0)
+        y_top = y1 - y_frac_from_top * (y1 - y0)
+
+        # Build simple HTML with colored bullets.
+        lines = []
+        for label, color in items:
+            lines.append(f'<span style="color:{color}; font-size:14px;">&#9679;</span> {label}')
+        text = "<br>".join(lines)
+
+        fig.add_annotation(
+            x=x,
+            y=y_top,
+            xref='paper',
+            yref='paper',
+            text=text,
+            showarrow=False,
+            align='left',
+            bgcolor='rgba(255,255,255,0.75)',
+            bordercolor='rgba(0,0,0,0.12)',
+            borderwidth=1,
+            borderpad=6,
+            font=dict(size=11, color='rgba(44,62,80,0.95)'),
+        )
+
+    # Row 1
     fig.add_trace(go.Bar(
         x=names, y=df['net_benefit'],
         marker_color=['#27ae60' if v >= 0 else '#e74c3c' for v in df['net_benefit']],
         hovertemplate='%{x}<br>Net Benefit: %{y:,.0f}<extra></extra>',
         showlegend=False,
     ), row=1, col=1)
+    fig.add_trace(go.Bar(x=names, y=df['pct_from_btm'], marker_color='#27ae60', showlegend=False, hovertemplate='%{x}<br>BTM: %{y:.1f}%<extra></extra>'), row=1, col=2)
+    fig.add_trace(go.Bar(x=names, y=df['pct_from_peak'], marker_color='#f39c12', showlegend=False, hovertemplate='%{x}<br>Peak: %{y:.1f}%<extra></extra>'), row=1, col=2)
+    fig.add_trace(go.Bar(x=names, y=df['pct_from_da'], marker_color='#3498db', showlegend=False, hovertemplate='%{x}<br>DA: %{y:.1f}%<extra></extra>'), row=1, col=2)
+    fig.add_trace(go.Bar(x=names, y=df['pct_from_fcr'], marker_color='#8e44ad', showlegend=False, hovertemplate='%{x}<br>FCR: %{y:.1f}%<extra></extra>'), row=1, col=2)
 
-    # 2 — Value attribution stacked bar
-    fig.add_trace(go.Bar(
-        x=names, y=df['pct_from_btm'], name='BTM',
-        marker_color='#27ae60',
-    ), row=1, col=2)
-    fig.add_trace(go.Bar(
-        x=names, y=df['pct_from_peak'], name='Peak',
-        marker_color='#e67e22',
-    ), row=1, col=2)
-    fig.add_trace(go.Bar(
-        x=names, y=df['pct_from_fcr'], name='FCR',
-        marker_color='#8e44ad',
-    ), row=1, col=2)
-
-    # 3 — Peak reduction
+    # Row 2
     fig.add_trace(go.Bar(
         x=names, y=df['peak_reduction_pct'],
         marker_color='#e67e22',
         hovertemplate='%{x}<br>Peak Reduction: %{y:.1f}%<extra></extra>',
         showlegend=False,
     ), row=2, col=1)
-
-    # 4 — FCR participation
     fig.add_trace(go.Bar(
         x=names, y=df['fcr_participation_rate'],
         marker_color='#8e44ad',
@@ -887,103 +982,563 @@ def create_scenario_comparison_dashboard(
         showlegend=False,
     ), row=2, col=2)
 
-    # 5 — Battery cycles
-    fig.add_trace(go.Bar(
-        x=names, y=df['equivalent_cycles'],
-        marker_color='#2980b9',
-        hovertemplate='%{x}<br>Cycles: %{y:.1f}<extra></extra>',
-        showlegend=False,
-    ), row=3, col=1)
+    # Row 3
+    fig.add_trace(go.Bar(x=names, y=df['btm_savings'], marker_color='#27ae60', showlegend=False, hovertemplate='%{x}<br>BTM Savings: %{y:,.0f}<extra></extra>'), row=3, col=1)
+    fig.add_trace(go.Bar(x=names, y=df['peak_savings'], marker_color='#f39c12', showlegend=False, hovertemplate='%{x}<br>Peak Savings: %{y:,.0f}<extra></extra>'), row=3, col=1)
+    fig.add_trace(go.Bar(x=names, y=df['day_ahead_arbitrage'], marker_color='#3498db', showlegend=False, hovertemplate='%{x}<br>DA Arbitrage: %{y:,.0f}<extra></extra>'), row=3, col=1)
+    fig.add_trace(go.Bar(x=names, y=df['fcr_revenue'], marker_color='#8e44ad', showlegend=False, hovertemplate='%{x}<br>FCR Revenue: %{y:,.0f}<extra></extra>'), row=3, col=1)
+    fig.add_trace(go.Bar(x=names, y=-df['degradation_cost'], marker_color='#e74c3c', showlegend=False, hovertemplate='%{x}<br>Degradation: %{y:,.0f}<extra></extra>'), row=3, col=1)
 
-    # 6 — Degradation cost
+    # Subset plot: focus on baseline vs a small set of cycle-strategy scenarios
+    eq_scenarios = ['Baseline', 'Three cycles', 'No limit']
+    if 'scenario_name' in df.columns:
+        df_eq = df[df['scenario_name'].isin(eq_scenarios)].copy()
+        order_map = {n: i for i, n in enumerate(eq_scenarios)}
+        df_eq['__order'] = df_eq['scenario_name'].map(order_map)
+        df_eq = df_eq.sort_values('__order')
+        names_eq = df_eq['scenario_name'].tolist()
+    else:
+        # Fallback if scenario_name isn't present
+        df_eq = df.copy()
+        names_eq = names
+
+    if len(df_eq) >= 1:
+        # Compute per-customer value per cycle when scenario_data is available.
+        # This shows the variation across customers (sites).
+        delta_t = 0.25  # hours; matches scenario_analysis.run_all_scenarios
+        if scenario_data and isinstance(scenario_data, dict):
+            vpc_mean = []
+            vpc_lo = []
+            vpc_hi = []
+            cycles_mean = []
+            cycles_lo = []
+            cycles_hi = []
+
+            def _compute_customer_cycles_and_vpc(payload: Dict) -> Tuple[np.ndarray, np.ndarray]:
+                df_detail = payload.get('df', None)
+                fin_sites = (payload.get('financials', {}) or {}).get('sites', {})
+                site_configs = payload.get('site_configs', [])
+
+                if df_detail is None or not isinstance(fin_sites, dict) or len(site_configs) == 0:
+                    return np.array([]), np.array([])
+
+                emax_map = {cfg.site_id: float(cfg.battery.E_max) for cfg in site_configs}
+
+                # Discharge energy per site (kWh)
+                if 'P_dis_BTM' in df_detail.columns and 'P_dis_FTM' in df_detail.columns:
+                    grouped = df_detail.groupby('site')[['P_dis_BTM', 'P_dis_FTM']].sum()
+                    discharge_kwh_by_site = grouped.sum(axis=1).to_dict()
+                else:
+                    return np.array([]), np.array([])
+
+                cycles_by_site = {}
+                vpc_by_site = {}
+                for sid, fin in fin_sites.items():
+                    e_max = emax_map.get(sid, None)
+                    if e_max is None or e_max <= 0:
+                        continue
+                    discharge_kwh = float(discharge_kwh_by_site.get(sid, 0.0))
+                    cycles = discharge_kwh / max(e_max, 1e-12)
+                    if cycles <= 0:
+                        continue
+                    cycles_by_site[sid] = cycles
+                    vpc_by_site[sid] = float(fin.get('net_benefit', 0.0)) / cycles
+
+                if len(cycles_by_site) == 0 or len(vpc_by_site) == 0:
+                    return np.array([]), np.array([])
+
+                # Use shared keys to ensure aligned arrays
+                common_sites = sorted(set(cycles_by_site.keys()).intersection(vpc_by_site.keys()))
+                cycles_vals = np.array([cycles_by_site[s] for s in common_sites], dtype=float)
+                vpc_vals = np.array([vpc_by_site[s] for s in common_sites], dtype=float)
+                return cycles_vals, vpc_vals
+
+            for _, row in df_eq.iterrows():
+                sid = row['scenario_id']
+                payload = scenario_data.get(sid, None) if isinstance(scenario_data, dict) else None
+                if payload is None:
+                    # Fallback to portfolio-level metric if payload is missing
+                    cycles_vals = np.array([float(row.get('equivalent_cycles', 0.0))], dtype=float)
+                    vpc_vals = np.array([float(row.get('value_per_cycle', 0.0))], dtype=float)
+                else:
+                    cycles_vals, vpc_vals = _compute_customer_cycles_and_vpc(payload)
+                    if cycles_vals.size == 0 or vpc_vals.size == 0:
+                        cycles_vals = np.array([float(row.get('equivalent_cycles', 0.0))], dtype=float)
+                        vpc_vals = np.array([float(row.get('value_per_cycle', 0.0))], dtype=float)
+
+                # Use robust uncertainty band: 10th–90th percentiles
+                vpc_mean.append(float(np.mean(vpc_vals)))
+                vpc_lo.append(float(np.quantile(vpc_vals, 0.10)))
+                vpc_hi.append(float(np.quantile(vpc_vals, 0.90)))
+                cycles_mean.append(float(np.mean(cycles_vals)))
+                cycles_lo.append(float(np.quantile(cycles_vals, 0.10)))
+                cycles_hi.append(float(np.quantile(cycles_vals, 0.90)))
+
+            fig.add_trace(go.Bar(
+                x=names_eq,
+                y=cycles_mean,
+                marker_color='#2980b9',
+                showlegend=False,
+                error_y=dict(
+                    type='data',
+                    symmetric=False,
+                    array=[hi - m for hi, m in zip(cycles_hi, cycles_mean)],
+                    arrayminus=[m - lo for lo, m in zip(cycles_lo, cycles_mean)],
+                    visible=True,
+                ),
+                hovertemplate='%{x}<br>Cycles (avg): %{y:.2f}<extra></extra>',
+            ), row=3, col=2)
+
+            fig.add_trace(go.Scatter(
+                x=names_eq,
+                y=vpc_mean,
+                mode='lines+markers',
+                line=dict(color='#16a085', width=2),
+                marker=dict(size=7),
+                error_y=dict(
+                    type='data',
+                    symmetric=False,
+                    array=[hi - m for hi, m in zip(vpc_hi, vpc_mean)],
+                    arrayminus=[m - lo for lo, m in zip(vpc_lo, vpc_mean)],
+                    visible=True,
+                ),
+                hovertemplate='%{x}<br>Value / Cycle (avg): %{y:,.0f}<extra></extra>',
+                showlegend=False,
+            ), row=3, col=2, secondary_y=True)
+        else:
+            # Fallback if scenario_data isn't provided
+            fig.add_trace(go.Bar(
+                x=names_eq,
+                y=df_eq['equivalent_cycles'],
+                marker_color='#2980b9',
+                showlegend=False,
+                hovertemplate='%{x}<br>Cycles: %{y:.2f}<extra></extra>',
+            ), row=3, col=2)
+            fig.add_trace(go.Scatter(
+                x=names_eq,
+                y=df_eq['value_per_cycle'],
+                mode='lines+markers',
+                line=dict(color='#16a085', width=2),
+                marker=dict(size=7),
+                hovertemplate='%{x}<br>Value / Cycle: %{y:,.0f}<extra></extra>',
+                showlegend=False,
+            ), row=3, col=2, secondary_y=True)
+
+    # Row 4
+    fig.add_trace(go.Bar(x=names, y=df['avg_soc_btm'], marker_color='#2ecc71', showlegend=False, hovertemplate='%{x}<br>Avg BTM SOC: %{y:.1f}%<extra></extra>'), row=4, col=1)
+    fig.add_trace(go.Bar(x=names, y=df['avg_soc_ftm'], marker_color='#9b59b6', showlegend=False, hovertemplate='%{x}<br>Avg FTM SOC: %{y:.1f}%<extra></extra>'), row=4, col=1)
+    fig.add_trace(go.Scatter(
+        x=names, y=df['avg_power_utilization'],
+        mode='lines+markers',
+        line=dict(color='#34495e', width=2),
+        marker=dict(size=7),
+        hovertemplate='%{x}<br>Power Utilization: %{y:.1f}%<extra></extra>',
+        showlegend=False,
+    ), row=4, col=1, secondary_y=True)
     fig.add_trace(go.Bar(
         x=names, y=df['degradation_cost'],
         marker_color='#e74c3c',
-        hovertemplate='%{x}<br>Degradation: %{y:,.0f}<extra></extra>',
+        hovertemplate='%{x}<br>Degradation Cost: %{y:,.0f}<extra></extra>',
         showlegend=False,
-    ), row=3, col=2)
+    ), row=4, col=2)
 
-    fig.update_layout(
-        title=dict(text='<b>Scenario Comparison Dashboard</b>', font=dict(size=18)),
-        height=1200,
-        template='plotly_white',
-        barmode='stack',
-        legend=dict(orientation='h', yanchor='bottom', y=-0.08, xanchor='center', x=0.5),
+    # ==========================================================================
+    # Row 5: Per-customer plot + BTM ratio comparison
+    # ==========================================================================
+    def _count_unique_months(time_index) -> int:
+        if time_index is None:
+            return 1
+        try:
+            if len(time_index) == 0:
+                return 1
+        except Exception:
+            # Some iterables (e.g., scalars) might not define len().
+            pass
+        try:
+            t = pd.to_datetime(list(time_index))
+            return max(int(t.to_period('M').nunique()), 1)
+        except Exception:
+            return 1
+
+    # --- 5A) Per customer plot (left): best vs worst (semi-transparent, grouped so they don't stack) ---
+    if scenario_data and isinstance(scenario_data, dict) and len(scenario_data) > 0:
+        try:
+            best_idx = df['net_benefit'].idxmax()
+            worst_idx = df['net_benefit'].idxmin()
+
+            best_scenario_id = df.loc[best_idx, 'scenario_id']
+            worst_scenario_id = df.loc[worst_idx, 'scenario_id']
+
+            best_payload = scenario_data.get(best_scenario_id, None)
+            worst_payload = scenario_data.get(worst_scenario_id, None)
+
+            if best_payload and isinstance(best_payload, dict):
+                best_fin_sites = best_payload.get('financials', {}).get('sites', {})
+                site_ids = sorted(best_fin_sites.keys())
+                best_months = _count_unique_months(best_payload.get('data', {}).get('time_index', []))
+
+                best_net_benefit_month = [
+                    float(best_fin_sites[sid].get('net_benefit', 0.0)) / best_months
+                    for sid in site_ids
+                ]
+
+                fig.add_trace(go.Bar(
+                    x=site_ids,
+                    y=best_net_benefit_month,
+                    name='Best scenario',
+                    marker_color='#27ae60',
+                    opacity=0.55,
+                    width=0.8,
+                    base=0,
+                    offset=0,
+                    hovertemplate='Customer: %{x}<br>Best profit: %{y:,.2f} €/month<extra></extra>',
+                    showlegend=False,
+                ), row=5, col=1)
+
+            if worst_payload and isinstance(worst_payload, dict):
+                worst_fin_sites = worst_payload.get('financials', {}).get('sites', {})
+                worst_months = _count_unique_months(worst_payload.get('data', {}).get('time_index', []))
+
+                # Align with the best scenario customer list
+                if 'site_ids' not in locals():
+                    site_ids = sorted(worst_fin_sites.keys())
+
+                worst_net_benefit_month = [
+                    float(worst_fin_sites.get(sid, {}).get('net_benefit', 0.0)) / worst_months
+                    for sid in site_ids
+                ]
+
+                fig.add_trace(go.Bar(
+                    x=site_ids,
+                    y=worst_net_benefit_month,
+                    name='Worst scenario',
+                    marker_color='#e74c3c',
+                    opacity=0.55,
+                    width=0.8,
+                    base=0,
+                    offset=0,
+                    hovertemplate='Customer: %{x}<br>Worst profit: %{y:,.2f} €/month<extra></extra>',
+                    showlegend=False,
+                ), row=5, col=1)
+        except Exception as e:
+            print(f"Warning: could not build per-customer plot: {e}")
+
+    # --- 5B) Comparison of the 3 scenarios (right): BTM 20/50/80 ---
+    # We filter to "base" settings when possible, to ensure it is mostly only BTM-ratio varying.
+    df_feas = df.copy()
+    for col in ['enable_fcr', 'use_forecast_prices', 'degradation_label', 'daily_cycle_limit']:
+        if col not in df_feas.columns:
+            df_feas[col] = None
+
+    candidates = df_feas
+    try:
+        candidates = candidates[
+            (candidates['enable_fcr'] == True)
+            & (candidates['use_forecast_prices'] == False)
+            & (candidates['degradation_label'] == 'base')
+            & (candidates['daily_cycle_limit'] == 2.0)
+        ]
+    except Exception:
+        candidates = df_feas
+    if len(candidates) < 3:
+        candidates = df_feas
+
+    def _pick_closest_btm(target: float):
+        if len(candidates) == 0:
+            return None
+        idx = (candidates['btm_ratio'] - target).abs().idxmin()
+        return candidates.loc[idx] if idx in candidates.index else None
+
+    chosen_rows = []
+    chosen_ids = set()
+    for t in target_btm:
+        r = _pick_closest_btm(t)
+        if r is not None:
+            sid = r['scenario_id']
+            if sid not in chosen_ids:
+                chosen_rows.append(r)
+                chosen_ids.add(sid)
+
+    chosen_df = pd.DataFrame(chosen_rows)
+    labels = [f"BTM {r['btm_ratio']*100:.0f}%" for _, r in chosen_df.iterrows()]
+    load_shifting = chosen_df['btm_savings'].to_numpy() if 'btm_savings' in chosen_df.columns else np.zeros(len(labels))
+    peak_shaving = chosen_df['peak_savings'].to_numpy() if 'peak_savings' in chosen_df.columns else np.zeros(len(labels))
+    da_arbitrage = chosen_df['day_ahead_arbitrage'].to_numpy() if 'day_ahead_arbitrage' in chosen_df.columns else np.zeros(len(labels))
+    fcr_revenue = chosen_df['fcr_revenue'].to_numpy() if 'fcr_revenue' in chosen_df.columns else np.zeros(len(labels))
+    degradation_cost = chosen_df['degradation_cost'].to_numpy() if 'degradation_cost' in chosen_df.columns else np.zeros(len(labels))
+
+    fig.add_trace(go.Bar(
+        x=labels, y=load_shifting,
+        name='Load Shifting',
+        marker_color='#27ae60',
+        hovertemplate='%{x}<br>Load Shifting: %{y:,.0f}<extra></extra>',
+        showlegend=False,
+    ), row=5, col=2)
+    fig.add_trace(go.Bar(
+        x=labels, y=peak_shaving,
+        name='Peak Shaving',
+        marker_color='#f39c12',
+        hovertemplate='%{x}<br>Peak Shaving: %{y:,.0f}<extra></extra>',
+        showlegend=False,
+    ), row=5, col=2)
+    fig.add_trace(go.Bar(
+        x=labels, y=da_arbitrage,
+        name='DA Arbitrage',
+        marker_color='#3498db',
+        hovertemplate='%{x}<br>DA Arbitrage: %{y:,.0f}<extra></extra>',
+        showlegend=False,
+    ), row=5, col=2)
+    fig.add_trace(go.Bar(
+        x=labels, y=fcr_revenue,
+        name='FCR Revenue',
+        marker_color='#8e44ad',
+        hovertemplate='%{x}<br>FCR Revenue: %{y:,.0f}<extra></extra>',
+        showlegend=False,
+    ), row=5, col=2)
+    fig.add_trace(go.Bar(
+        x=labels, y=-degradation_cost,
+        name='Degradation Cost',
+        marker_color='#e74c3c',
+        hovertemplate='%{x}<br>Degradation Cost: %{y:,.0f}<extra></extra>',
+        showlegend=False,
+    ), row=5, col=2)
+
+    # Ensure subplot title matches the ACTUALLY chosen BTM ratios (may differ from targets
+    # if the strict candidate filter leaves fewer than 3 scenarios).
+    try:
+        actual_btm_title = "/".join([str(int(round(r * 100))) for r in chosen_df['btm_ratio'].tolist()])
+        for ann in fig.layout.annotations or []:
+            if isinstance(ann.text, str) and 'BTM Ratio Comparison' in ann.text:
+                ann.text = f'<b>BTM Ratio Comparison ({actual_btm_title})</b>'
+    except Exception:
+        # If title override fails, keep the originally set subplot title.
+        pass
+
+    # Local legends (one per plot cell), positioned inside each subplot's domain
+    # to avoid overlapping other cells.
+    _add_local_legend(
+        row=1, col=1,
+        items=[
+            ('Positive Net Benefit', '#27ae60'),
+            ('Negative Net Benefit', '#e74c3c'),
+        ],
+    )
+    _add_local_legend(
+        row=1, col=2,
+        items=[
+            ('Load Shifting', '#27ae60'),
+            ('Peak Shaving', '#f39c12'),
+            ('DA Arbitrage', '#3498db'),
+            ('FCR Revenue', '#8e44ad'),
+        ],
+    )
+    _add_local_legend(
+        row=2, col=1,
+        items=[
+            ('Peak Reduction', '#e67e22'),
+        ],
+    )
+    _add_local_legend(
+        row=2, col=2,
+        items=[
+            ('FCR Participation', '#8e44ad'),
+        ],
+    )
+    _add_local_legend(
+        row=3, col=1,
+        items=[
+            ('Load Shifting', '#27ae60'),
+            ('Peak Shaving', '#f39c12'),
+            ('DA Arbitrage', '#3498db'),
+            ('FCR Revenue', '#8e44ad'),
+            ('Degradation Cost', '#e74c3c'),
+        ],
+    )
+    _add_local_legend(
+        row=3, col=2,
+        items=[
+            ('Equivalent Cycles', '#2980b9'),
+            ('Value / Cycle', '#16a085'),
+        ],
+    )
+    _add_local_legend(
+        row=4, col=1,
+        items=[
+            ('Avg BTM SOC', '#2ecc71'),
+            ('Avg FTM SOC', '#9b59b6'),
+            ('Power Utilization', '#34495e'),
+        ],
+    )
+    _add_local_legend(
+        row=4, col=2,
+        items=[
+            ('Degradation Cost', '#e74c3c'),
+        ],
+    )
+    _add_local_legend(
+        row=5, col=1,
+        items=[
+            ('Best scenario', '#27ae60'),
+            ('Worst scenario', '#e74c3c'),
+        ],
+    )
+    _add_local_legend(
+        row=5, col=2,
+        items=[
+            ('Load Shifting', '#27ae60'),
+            ('Peak Shaving', '#f39c12'),
+            ('DA Arbitrage', '#3498db'),
+            ('FCR Revenue', '#8e44ad'),
+            ('Degradation Cost', '#e74c3c'),
+        ],
     )
 
-    if output_file:
-        fig.write_html(str(output_file), include_plotlyjs='cdn')
-        print(f"Dashboard saved to {output_file}")
+    # ==========================================================================
+    # Row 6: Breakdown (two stacked bars per comparison)
+    # ==========================================================================
+    def _format_scenario_attributes_hover(row: pd.Series) -> str:
+        scenario_name = str(row.get('scenario_name', row.get('scenario_id', 'Scenario')))
+        btm_pct = float(row.get('btm_ratio', 0.0)) * 100.0
+        fcr_on = bool(row.get('enable_fcr', True))
+        forecast_on = bool(row.get('use_forecast_prices', False))
+        daily_cycle_limit = row.get('daily_cycle_limit', None)
+        degradation_label = str(row.get('degradation_label', 'base'))
 
-    return fig
+        fcr_txt = 'On' if fcr_on else 'Off'
+        forecast_txt = 'On' if forecast_on else 'Off'
+        if daily_cycle_limit is None or (isinstance(daily_cycle_limit, float) and np.isnan(daily_cycle_limit)):
+            cycles_txt = 'No limit'
+        else:
+            cycles_txt = f"{float(daily_cycle_limit):g}"
 
+        return (
+            f"BTM {btm_pct:.0f}% | FCR {fcr_txt} | Forecast {forecast_txt} | Cycles/day {cycles_txt} | Deg {degradation_label}"
+        )
 
-def create_detailed_insights_report(
-    results_df: pd.DataFrame,
-    output_file: Path = None
-) -> go.Figure:
-    """
-    Create detailed insights for named scenarios using grouped bar / scatter charts.
-    """
+    def _get_row_by_scenario_name(df_in: pd.DataFrame, scenario_name: str) -> Optional[pd.Series]:
+        if 'scenario_name' not in df_in.columns:
+            return None
+        matches = df_in[df_in['scenario_name'] == scenario_name]
+        if len(matches) == 0:
+            return None
+        return matches.iloc[0]
 
-    df = results_df[results_df['feasible']].copy()
-    if len(df) == 0:
-        print("No feasible scenarios to create insights report!")
-        return None
+    def _component_stack_values(row: pd.Series) -> Dict[str, float]:
+        # Note: request uses "Load Shifting" instead of "BTM savings".
+        load_shifting = float(row.get('btm_savings', 0.0))
+        peak_shaving = float(row.get('peak_savings', 0.0))
+        da_arbitrage = float(row.get('day_ahead_arbitrage', 0.0))
+        fcr_revenue = float(row.get('fcr_revenue', 0.0))
+        degradation_cost = float(row.get('degradation_cost', 0.0))  # positive cost
+        return {
+            'Load Shifting': load_shifting,
+            'Peak Shaving': peak_shaving,
+            'DA Arbitrage': da_arbitrage,
+            'FCR Revenue': fcr_revenue,
+            'Degradation Cost': -degradation_cost,  # plot as negative
+        }
 
-    name_col = 'scenario_name' if 'scenario_name' in df.columns else 'scenario_id'
-    names = df[name_col].tolist()
+    def _add_two_scenario_stacked_breakdown(
+        row_col: Tuple[int, int],
+        scenario_left: str,
+        scenario_right: str,
+        colors: Dict[str, str],
+    ):
+        r, c = row_col
+        left_row = _get_row_by_scenario_name(df, scenario_left)
+        right_row = _get_row_by_scenario_name(df, scenario_right)
+        if left_row is None or right_row is None:
+            return
 
-    df['value_per_cycle'] = df['net_benefit'] / df['equivalent_cycles'].replace(0, np.nan)
+        x_scenarios = [scenario_left, scenario_right]
+        attrs = [_format_scenario_attributes_hover(left_row), _format_scenario_attributes_hover(right_row)]
 
-    fig = make_subplots(
-        rows=3, cols=2,
-        subplot_titles=(
-            '<b>Financial Breakdown</b>',
-            '<b>Self-Consumption vs Grid Dependency</b>',
-            '<b>FCR Revenue</b>',
-            '<b>Value per Cycle</b>',
-            '<b>Average SOC (BTM / FTM)</b>',
-            '<b>Power Utilization (%)</b>',
-        ),
-        vertical_spacing=0.12,
-        horizontal_spacing=0.12,
+        stack = {
+            'Load Shifting': ('Load Shifting', colors['Load Shifting'], lambda v: v),
+            'Peak Shaving': ('Peak Shaving', colors['Peak Shaving'], lambda v: v),
+            'DA Arbitrage': ('DA Arbitrage', colors['DA Arbitrage'], lambda v: v),
+            'FCR Revenue': ('FCR Revenue', colors['FCR Revenue'], lambda v: v),
+            'Degradation Cost': ('Degradation Cost', colors['Degradation Cost'], lambda v: v),
+        }
+
+        # Plot one trace per component so Plotly stacks them within the subplot.
+        for key, (label, color, _) in stack.items():
+            left_val = _component_stack_values(left_row)[key]
+            right_val = _component_stack_values(right_row)[key]
+
+            # For degradation (negative in plot), show positive cost in hover.
+            left_abs_for_hover = abs(left_val)
+            right_abs_for_hover = abs(right_val)
+
+            customdata = [
+                [left_abs_for_hover, attrs[0]],
+                [right_abs_for_hover, attrs[1]],
+            ]
+
+            fig.add_trace(
+                go.Bar(
+                    x=x_scenarios,
+                    y=[left_val, right_val],
+                    customdata=customdata,
+                    marker_color=color,
+                    name=label,
+                    showlegend=False,
+                    hovertemplate=f"%{{x}}<br>{label}: %{{customdata[0]:,.0f}} €<br>%{{customdata[1]}}<extra></extra>",
+                ),
+                row=r,
+                col=c,
+            )
+
+    stack_colors = {
+        'Load Shifting': '#27ae60',
+        'Peak Shaving': '#f39c12',
+        'DA Arbitrage': '#3498db',
+        'FCR Revenue': '#8e44ad',
+        'Degradation Cost': '#e74c3c',
+    }
+
+    _add_two_scenario_stacked_breakdown(
+        row_col=(6, 1),
+        scenario_left='Baseline',
+        scenario_right='Uncertain prices',
+        colors=stack_colors,
+    )
+    _add_two_scenario_stacked_breakdown(
+        row_col=(6, 2),
+        scenario_left='Baseline',
+        scenario_right='No FCR',
+        colors=stack_colors,
     )
 
-    # 1 — Financials stacked
-    fig.add_trace(go.Bar(x=names, y=df['btm_savings'], name='BTM Savings', marker_color='#27ae60'), row=1, col=1)
-    fig.add_trace(go.Bar(x=names, y=df['peak_savings'], name='Peak Savings', marker_color='#e67e22'), row=1, col=1)
-    fig.add_trace(go.Bar(x=names, y=df['fcr_revenue'], name='FCR Revenue', marker_color='#8e44ad'), row=1, col=1)
-    fig.add_trace(go.Bar(x=names, y=-df['degradation_cost'], name='Degradation', marker_color='#e74c3c'), row=1, col=1)
-
-    # 2 — Self-consumption and grid dependency
-    fig.add_trace(go.Bar(x=names, y=df['self_consumption_rate'], name='Self-consumption %', marker_color='#2ecc71', showlegend=False), row=1, col=2)
-    fig.add_trace(go.Bar(x=names, y=df['grid_dependency'], name='Grid dependency %', marker_color='#3498db', showlegend=False), row=1, col=2)
-
-    # 3 — FCR revenue bar
-    fig.add_trace(go.Bar(x=names, y=df['fcr_revenue'], marker_color='#8e44ad', showlegend=False), row=2, col=1)
-
-    # 4 — Value per cycle
-    fig.add_trace(go.Bar(x=names, y=df['value_per_cycle'], marker_color='#16a085', showlegend=False), row=2, col=2)
-
-    # 5 — SOC grouped bar
-    fig.add_trace(go.Bar(x=names, y=df['avg_soc_btm'], name='BTM SOC', marker_color='#2ecc71', showlegend=False), row=3, col=1)
-    fig.add_trace(go.Bar(x=names, y=df['avg_soc_ftm'], name='FTM SOC', marker_color='#9b59b6', showlegend=False), row=3, col=1)
-
-    # 6 — Power utilization
-    fig.add_trace(go.Bar(x=names, y=df['avg_power_utilization'], marker_color='#2980b9', showlegend=False), row=3, col=2)
-
     fig.update_layout(
-        title=dict(text='<b>Detailed Scenario Insights</b>', font=dict(size=18)),
-        height=1200,
+        title=dict(text='<b>Scenario Overview Dashboard</b>', font=dict(size=18)),
+        height=3400,
         template='plotly_white',
         barmode='relative',
-        legend=dict(orientation='h', yanchor='bottom', y=-0.08, xanchor='center', x=0.5),
+        showlegend=False,
+        margin=dict(t=90, b=70, l=60, r=60),
     )
+
+    fig.update_yaxes(title_text='€', row=1, col=1)
+    fig.update_yaxes(title_text='Attribution (%)', row=1, col=2)
+    fig.update_yaxes(title_text='Peak Reduction (%)', row=2, col=1)
+    fig.update_yaxes(title_text='FCR Participation (%)', row=2, col=2)
+    fig.update_yaxes(title_text='€', row=3, col=1)
+    fig.update_yaxes(title_text='Cycles', row=3, col=2)
+    fig.update_yaxes(title_text='€/Cycle', row=3, col=2, secondary_y=True)
+    fig.update_yaxes(title_text='SOC (%)', row=4, col=1)
+    fig.update_yaxes(title_text='Utilization (%)', row=4, col=1, secondary_y=True)
+    fig.update_yaxes(title_text='€', row=4, col=2)
+    fig.update_yaxes(title_text='€/month', row=5, col=1)
+    fig.update_yaxes(title_text='€', row=5, col=2)
+    fig.update_yaxes(title_text='€', row=6, col=1)
+    fig.update_yaxes(title_text='€', row=6, col=2)
+    fig.update_xaxes(tickangle=-20)
+    fig.update_xaxes(tickangle=-90, row=5, col=1)
 
     if output_file:
         fig.write_html(str(output_file), include_plotlyjs='cdn')
-        print(f"Insights report saved to {output_file}")
+        print(f"Overview dashboard saved to {output_file}")
 
     return fig
 
@@ -1011,10 +1566,13 @@ def print_scenario_summary(results_df: pd.DataFrame):
 
     ranked = df.sort_values('net_benefit', ascending=False)
     for rank, (_, row) in enumerate(ranked.iterrows(), 1):
-        if row['pct_from_peak'] > max(row['pct_from_btm'], row['pct_from_fcr']):
+        pct_da = row.get('pct_from_da', 0.0)
+        if row['pct_from_peak'] > max(row['pct_from_btm'], row['pct_from_fcr'], pct_da):
             strategy = 'Peak'
-        elif row['pct_from_fcr'] > max(row['pct_from_btm'], row['pct_from_peak']):
+        elif row['pct_from_fcr'] > max(row['pct_from_btm'], row['pct_from_peak'], pct_da):
             strategy = 'FCR'
+        elif pct_da > max(row['pct_from_btm'], row['pct_from_peak'], row['pct_from_fcr']):
+            strategy = 'DA'
         else:
             strategy = 'BTM'
         name = row['scenario_name'] if has_name else row['scenario_id']
@@ -1046,8 +1604,8 @@ if __name__ == "__main__":
     # =========================================================================
     # DATE RANGE — change these to run for a week, month, or full year
     # =========================================================================
-    START_DATE = "2024-01-01"
-    END_DATE   = "2024-01-07"   # 1-week test; change to e.g. "2024-01-31" or "2024-12-31"
+    START_DATE = "2024-06-01"
+    END_DATE   = "2024-08-31"   # 1-week test; change to e.g. "2024-01-31" or "2024-12-31"
 
     # Annual peak tariff (EUR/kW/year) — prorated automatically
     C_PEAK_ANNUAL = 192.66
@@ -1081,7 +1639,7 @@ if __name__ == "__main__":
                 eta_ch=0.974,
                 eta_dis=0.974,
                 I0=73000.0,
-                V_bat=777.0,
+                V_bat=0.777,
             ),
             btm_ratio=0.4,
             P_buy_max=200.0,
@@ -1159,13 +1717,10 @@ if __name__ == "__main__":
     elif GENERATE_DASHBOARDS:
         print("\nGenerating comparison visualizations...")
 
-        fig1 = create_scenario_comparison_dashboard(
+        fig_overview = create_scenario_overview_dashboard(
             results_df,
-            output_file=OUTPUTS_DIR / "scenario_comparison_dashboard.html",
-        )
-        fig2 = create_detailed_insights_report(
-            results_df,
-            output_file=OUTPUTS_DIR / "scenario_insights.html",
+            output_file=OUTPUTS_DIR / "scenario_overview_dashboard.html",
+            scenario_data=scenario_data,
         )
 
         print("\nGenerating master navigation...")
@@ -1181,8 +1736,7 @@ if __name__ == "__main__":
         print("\nGenerated files:")
         print("  outputs/scenario_results.csv            - Raw results data")
         print("  outputs/scenario_master.html            - MASTER NAVIGATION (start here!)")
-        print("  outputs/scenario_comparison_dashboard.html - Comparison charts")
-        print("  outputs/scenario_insights.html          - Detailed insights")
+        print("  outputs/scenario_overview_dashboard.html - Merged comparison + insights")
         print("  outputs/scenario_outputs/               - Individual scenario dashboards")
     else:
         print("\nDashboard generation skipped (GENERATE_DASHBOARDS = False)")
