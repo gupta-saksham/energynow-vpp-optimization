@@ -133,19 +133,33 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
 def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     """Generate dashboards from scenario analysis results."""
     from lib.results_io import load_scenario_results, get_latest_results
+    # Ensure pickle can resolve ScenarioResult when scenario_analysis was previously
+    # saved while running as `__main__`. The unpickler looks for `__main__.ScenarioResult`.
+    import scenario_analysis as _scenario_analysis
+    globals()['ScenarioResult'] = _scenario_analysis.ScenarioResult
     from scenario_analysis import (
-        create_scenario_comparison_dashboard,
-        create_detailed_insights_report,
+        create_scenario_overview_dashboard,
         create_master_navigation,
         print_scenario_summary
     )
+    from lib.paths import RESULTS_DIR
     
     # Get filepath
     if filepath is None:
         filepath = get_latest_results('scenario_analysis')
+        # Fallback: some older pickles may have `type="unknown"` in the metadata.
+        # In that case, pick the newest `scenarios_*.pkl` directly by mtime.
         if filepath is None:
-            print("❌ No scenario results found. Run scenario_analysis.py first.")
-            return False
+            scenario_pickles = sorted(
+                list(RESULTS_DIR.glob('scenarios_*.pkl')),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if len(scenario_pickles) > 0:
+                filepath = str(scenario_pickles[0])
+            else:
+                print("❌ No scenario results found. Run scenario_analysis.py first.")
+                return False
     
     # Load results
     print("\n" + "="*70)
@@ -174,16 +188,11 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     print("GENERATING SCENARIO DASHBOARDS")
     print("="*70)
     
-    print("\nCreating comparison dashboard...")
-    create_scenario_comparison_dashboard(
+    print("\nCreating merged scenario overview dashboard...")
+    create_scenario_overview_dashboard(
         results_df,
-        output_file=OUTPUTS_DIR / "scenario_comparison_dashboard.html"
-    )
-    
-    print("\nCreating insights report...")
-    create_detailed_insights_report(
-        results_df,
-        output_file=OUTPUTS_DIR / "scenario_insights.html"
+        output_file=OUTPUTS_DIR / "scenario_overview_dashboard.html",
+        scenario_data=all_results,
     )
     
     print("\nCreating master navigation...")
@@ -198,8 +207,7 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     print("="*70)
     print("\nFiles created in outputs/:")
     print("  🌐 scenario_master.html - Start here!")
-    print("  📊 scenario_comparison_dashboard.html")
-    print("  📈 scenario_insights.html")
+    print("  📊 scenario_overview_dashboard.html")
     
     return True
 
