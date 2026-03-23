@@ -159,18 +159,22 @@ def create_multi_battery_dashboard(
     output_file: Path = None,
     delta_t: float = 0.25,
     C_peak: float = None,
+    reconcile_debug: bool = False,
 ) -> go.Figure:
     """
-    Create comprehensive multi-battery VPP dashboard with proper subplots.
+    Create a clean single-page portfolio dashboard with dedicated sections:
+    BTM operations, FTM/FCR operations, and financial/degradation summaries.
     """
-    
+
     site_ids = df['site'].unique().tolist()
-    
+
     # Aggregate data across all sites
     agg_df = df.groupby('t').agg({
         'datetime': 'first',
         'demand': 'sum',
         'P_buy': 'sum',
+        'P_buy_BTM': 'sum',
+        'P_buy_FTM': 'sum',
         'P_sell': 'sum',
         'Grid_Net': 'sum',
         'P_ch_BTM': 'sum',
@@ -187,75 +191,218 @@ def create_multi_battery_dashboard(
         'FCR_total': 'first',
         'u_FCR': 'first',
         'FCR_signal': 'first',
+        'SOH': 'mean',
     }).reset_index()
-    
+
     total_E_max = sum(cfg.battery.E_max for cfg in site_configs)
     total_E_btm = sum(cfg.battery.E_max * cfg.btm_ratio for cfg in site_configs)
     total_E_ftm = sum(cfg.battery.E_max * (1 - cfg.btm_ratio) for cfg in site_configs)
-    
-    agg_df['SOC_pct'] = 100 * agg_df['SOC_total'] / total_E_max
-    agg_df['SOC_BTM_pct'] = 100 * agg_df['SOC_BTM'] / total_E_btm
-    agg_df['SOC_FTM_pct'] = 100 * agg_df['SOC_FTM'] / total_E_ftm
-    
+
+    agg_df['SOC_pct'] = 100 * agg_df['SOC_total'] / max(total_E_max, 1e-9)
+    agg_df['SOC_BTM_pct'] = np.where(
+        total_E_btm > 1e-9, 100 * agg_df['SOC_BTM'] / total_E_btm, 0.0
+    )
+    agg_df['SOC_FTM_pct'] = np.where(
+        total_E_ftm > 1e-9, 100 * agg_df['SOC_FTM'] / total_E_ftm, 0.0
+    )
+
     # Classify actions
     agg_df = classify_actions(agg_df)
-    
+
     # Calculate running peak
+    # Portfolio running peak = running maximum of the portfolio net grid import (P_buy).
     agg_df['running_peak'] = agg_df['P_buy'].expanding().max()
+    agg_df['running_peak_btm'] = agg_df['P_buy_BTM'].expanding().max()
 
-    # --- Pre-calculate Revenue Streams for Attribution ---
-    # 1. BTM Savings: Avoided cost (Demand - P_buy_BTM) * Retail Price
-    #    Note: This is an approximation using aggregated values. Accuracy depends on site-level details,
-    #    but for dashboard visualization it is sufficient.
-    #    Using P_dis_BTM approximation for visualization impact
-    agg_df['val_btm_savings'] = agg_df['P_dis_BTM'] * agg_df['Price industrial'] * delta_t
-    
-    # 2. DA Arbitrage: Revenue Sell - Cost Buy FTM
-    agg_df['val_da_arb'] = (agg_df['P_sell'] * agg_df['Price'] - agg_df['P_ch_FTM'] * agg_df['Price']) * delta_t
-    
-    # 3. FCR Revenue (FCR price is already EUR/kW per step — no delta_t)
-    agg_df['val_fcr'] = agg_df['FCR_total'] * agg_df['FCR_price']
+    # FCR: reserved vs activated average power in each step
+    agg_df['fcr_activation_fraction'] = agg_df['FCR_signal'] / 3600.0
+    agg_df['FCR_activated_power'] = agg_df['FCR_total'] * agg_df['fcr_activation_fraction']
+    agg_df['FCR_activation_ratio'] = np.where(
+        agg_df['FCR_total'] > 1e-6,
+        100 * np.abs(agg_df['FCR_activated_power']) / agg_df['FCR_total'],
+        0.0,
+    )
 
-    # Reconciliation: dashboard FCR sum should match calculate_financials
-    _fcr_dashboard = agg_df['val_fcr'].sum()
-    _fcr_financials = financials['portfolio']['fcr_revenue']
-    if abs(_fcr_dashboard - _fcr_financials) > max(1.0, 0.01 * abs(_fcr_financials)):
-        print(f"⚠  FCR reconciliation: dashboard sum €{_fcr_dashboard:,.2f} "
-              f"vs financials €{_fcr_financials:,.2f} "
-              f"(diff €{_fcr_dashboard - _fcr_financials:,.2f})")
+    # --- Exact per-step realized cashflows (consistent with calculate_financials) ---
+    df_cash = df.copy()
+    df_cash['datetime_idx'] = pd.to_datetime(df_cash['datetime'])
+    df_cash['cash_btm'] = (df_cash['demand'] - df_cash['P_buy_BTM']) * df_cash['Price industrial'] * delta_t
+    df_cash['cash_da'] = (df_cash['P_sell'] - df_cash['P_buy_FTM']) * df_cash['Price'] * delta_t
+    df_cash['cash_fcr'] = df_cash['FCR_price'] * df_cash['P_FCR_bid']
+
+    cash_by_t = df_cash.groupby('t', as_index=False)[['cash_btm', 'cash_da', 'cash_fcr']].sum()
+    agg_df = agg_df.merge(cash_by_t, on='t', how='left')
+    agg_df[['cash_btm', 'cash_da', 'cash_fcr']] = agg_df[['cash_btm', 'cash_da', 'cash_fcr']].fillna(0.0)
+
+    # SOH and cumulative degradation cost trajectory (per-site exact mapping, then portfolio sum)
+    site_i0_map = {cfg.site_id: cfg.battery.I0 for cfg in site_configs}
+    df_cash['I0_site'] = df_cash['site'].map(site_i0_map).astype(float)
+    soh_start_map = df_cash.sort_values(['site', 't']).groupby('site')['SOH'].first().to_dict()
+    df_cash['SOH0_site'] = df_cash['site'].map(soh_start_map).astype(float)
+    soh_denom = (df_cash['SOH0_site'] - 0.6).replace(0, np.nan)
+    df_cash['deg_cost_to_t'] = df_cash['I0_site'] * (df_cash['SOH0_site'] - df_cash['SOH']) / soh_denom
+    df_cash['deg_cost_to_t'] = df_cash['deg_cost_to_t'].replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
+    deg_by_t = df_cash.groupby('t', as_index=False)['deg_cost_to_t'].sum()
+    agg_df = agg_df.merge(deg_by_t, on='t', how='left')
+    agg_df['deg_cost_to_t'] = agg_df['deg_cost_to_t'].fillna(0.0)
+
+    # Causal monthly series
+    agg_df['datetime_idx'] = pd.to_datetime(agg_df['datetime'])
+    monthly_energy = agg_df.set_index('datetime_idx')[['cash_btm', 'cash_da', 'cash_fcr']].resample('ME').sum()
+    monthly_energy = monthly_energy.rename(columns={
+        'cash_btm': 'val_load_shifting',
+        'cash_da': 'val_da_arb',
+        'cash_fcr': 'val_fcr',
+    })
+
+    # Peak savings monthly allocation by actual peak event timing per site
+    c_peak_effective = C_peak
+    if c_peak_effective is None:
+        c_peak_candidates = []
+        for site_id, site_fin in financials.get('sites', {}).items():
+            peak_kw_old = float(site_fin.get('peak_kw_old', 0.0))
+            baseline_peak = float(site_fin.get('baseline_peak', 0.0))
+            if peak_kw_old > 0:
+                c_peak_candidates.append(baseline_peak / peak_kw_old)
+        c_peak_effective = float(np.mean(c_peak_candidates)) if c_peak_candidates else 0.0
+
+    monthly_baseline_peak = {}
+    monthly_optimized_peak = {}
+    for site_id, site_df in df_cash.groupby('site'):
+        site_df_sorted = site_df.sort_values('t')
+        if site_df_sorted.empty:
+            continue
+        idx_old = site_df_sorted['demand'].idxmax()
+        month_old = site_df_sorted.loc[idx_old, 'datetime_idx'].to_period('M').to_timestamp('M')
+        baseline_peak_cost = site_df_sorted.loc[idx_old, 'demand'] * c_peak_effective
+
+        p_peak_new = float(site_df_sorted['P_peak'].iloc[0])
+        idx_new = (site_df_sorted['P_buy_BTM'] + site_df_sorted['P_buy_FTM']).idxmax()
+        month_new = site_df_sorted.loc[idx_new, 'datetime_idx'].to_period('M').to_timestamp('M')
+        peak_cost_new = p_peak_new * c_peak_effective
+
+        monthly_baseline_peak[month_old] = monthly_baseline_peak.get(month_old, 0.0) + baseline_peak_cost
+        monthly_optimized_peak[month_new] = monthly_optimized_peak.get(month_new, 0.0) + peak_cost_new
+
+    monthly_peak_df = pd.DataFrame(index=monthly_energy.index)
+    monthly_peak_df['baseline_peak_cost'] = [monthly_baseline_peak.get(m, 0.0) for m in monthly_peak_df.index]
+    monthly_peak_df['optimized_peak_cost'] = [monthly_optimized_peak.get(m, 0.0) for m in monthly_peak_df.index]
+    monthly_peak_df['val_peak_savings'] = monthly_peak_df['baseline_peak_cost'] - monthly_peak_df['optimized_peak_cost']
+
+    monthly_df = pd.concat([monthly_energy, monthly_peak_df[['val_peak_savings']]], axis=1).fillna(0.0)
+    monthly_df['month_name'] = monthly_df.index.strftime('%B %Y')
+
+    # Optional strict reconciliation checks
+    if reconcile_debug:
+        port = financials['portfolio']
+        checks = [
+            ('btm_savings', monthly_df['val_load_shifting'].sum(), port.get('btm_savings', 0.0)),
+            ('day_ahead_arbitrage', monthly_df['val_da_arb'].sum(), port.get('day_ahead_arbitrage', 0.0)),
+            ('peak_savings', monthly_df['val_peak_savings'].sum(), port.get('peak_savings', 0.0)),
+            ('fcr_revenue', monthly_df['val_fcr'].sum(), port.get('fcr_revenue', 0.0)),
+            ('degradation_cost', agg_df['deg_cost_to_t'].iloc[-1] if len(agg_df) else 0.0, port.get('degradation_cost', 0.0)),
+        ]
+        for name, observed, expected in checks:
+            tol = max(1.0, 0.01 * abs(expected))
+            if abs(observed - expected) > tol:
+                raise AssertionError(
+                    f"Reconciliation failed for {name}: observed={observed:.4f}, expected={expected:.4f}, tol={tol:.4f}"
+                )
+
+        net_observed = (
+            monthly_df['val_load_shifting'].sum()
+            + monthly_df['val_da_arb'].sum()
+            + monthly_df['val_peak_savings'].sum()
+            + monthly_df['val_fcr'].sum()
+            - (agg_df['deg_cost_to_t'].iloc[-1] if len(agg_df) else 0.0)
+        )
+        net_expected = port.get('net_benefit', 0.0)
+        tol = max(1.0, 0.01 * abs(net_expected))
+        if abs(net_observed - net_expected) > tol:
+            raise AssertionError(
+                f"Reconciliation failed for net_benefit: observed={net_observed:.4f}, expected={net_expected:.4f}, tol={tol:.4f}"
+            )
+
+    # ==========================================================================
+    # Secondary-axis ranges (robust, data-driven)
+    # ==========================================================================
+    def _robust_axis_range(values, q_low: float = 0.01, q_high: float = 0.99, pad_frac: float = 0.05,
+                            include_zero: bool = False):
+        """Compute a robust [min,max] for Plotly `range` using quantiles."""
+        arr = np.asarray(pd.to_numeric(values, errors='coerce'), dtype=float)
+        arr = arr[~np.isnan(arr)]
+        if arr.size == 0:
+            return [0.0, 1.0]
+
+        lo = float(np.quantile(arr, q_low))
+        hi = float(np.quantile(arr, q_high))
+
+        if include_zero:
+            lo = min(lo, 0.0)
+            hi = max(hi, 0.0)
+
+        if np.isclose(lo, hi):
+            pad = abs(hi) * pad_frac if not np.isclose(hi, 0.0) else 1.0
+            lo -= pad
+            hi += pad
+        else:
+            span = hi - lo
+            lo -= span * pad_frac
+            hi += span * pad_frac
+        return [lo, hi]
+
+    # Prices are plotted on secondary axes; make the scale robust so outliers
+    # don't flatten the curve.
+    retail_range = _robust_axis_range(agg_df['Price industrial'] * 1000, include_zero=True)
+    da_range = _robust_axis_range(agg_df['Price'] * 1000, include_zero=True)
+    row5_price_range = _robust_axis_range(
+        np.concatenate([(agg_df['Price'] * 1000).to_numpy(), (agg_df['FCR_price'] * 1000).to_numpy()]),
+        include_zero=True
+    )
+
+    # Utilization / allocation on FCR utilization secondary axis.
+    sec_row6_alloc_vals = np.where(agg_df['u_FCR'] > 0.5, 100.0, 0.0)
+    sec_row6_activation_range = _robust_axis_range(
+        np.concatenate([sec_row6_alloc_vals, agg_df['FCR_activation_ratio'].to_numpy()]),
+        include_zero=True
+    )
+
+    # Degradation cost on SOH/degradation secondary axis.
+    sec_row8_degradation_range = _robust_axis_range(agg_df['deg_cost_to_t'], include_zero=True)
 
     # ==========================================================================
     # CREATE SUBPLOT FIGURE
     # ==========================================================================
-    
+
     fig = make_subplots(
-        rows=6, cols=1,
-        shared_xaxes=False, # We will manually link rows 1-5, Row 6 is monthly
-        vertical_spacing=0.03,
-        row_heights=[0.16, 0.16, 0.16, 0.16, 0.16, 0.20],
+        rows=7, cols=1,
+        shared_xaxes=False,
+        vertical_spacing=0.035,
+        row_heights=[0.13, 0.14, 0.11, 0.11, 0.12, 0.18, 0.21],
         subplot_titles=(
             '<b>1. GRID EXCHANGE</b> — Import (+) / Export (-) vs Original Demand',
-            '<b>2. BATTERY OPERATIONS</b> — BTM (Local Load) vs FTM (FCR Market)',
-            '<b>3. FTM OVERVIEW</b> — SOC, DA Price & FCR Price',
-            '<b>4. BTM OVERVIEW</b> — SOC & Retail Price',
-            '<b>5. FCR PARTICIPATION</b> — Aggregated Bid (≥1MW required)',
-            '<b>6. MONTHLY REVENUE ATTRIBUTION</b> — Stacked Value Creation'
+            '<b>2. BATTERY OPERATIONS (BTM + FTM)</b> — Charge (+) / Discharge (-), colored by domain',
+            '<b>3. BTM SOC</b> — BTM SOC and retail tariff',
+            '<b>4. FTM SOC & PRICES</b> — FTM SOC with DA/FCR prices',
+            '<b>5. FCR UTILIZATION</b> — Reserved capacity vs activated power',
+            '<b>6. MONTHLY FINANCIAL STACK</b> — Value attribution by month',
+            '<b>7. SOH & DEGRADATION</b> — State of health and cumulative degradation cost',
         ),
         specs=[
             [{"secondary_y": True}],
+            [{"secondary_y": True}],
+            [{"secondary_y": True}],
+            [{"secondary_y": True}],
+            [{"secondary_y": True}],
             [{"secondary_y": False}],
-            [{"secondary_y": True}], # FTM: SOC + Prices
-            [{"secondary_y": True}], # BTM: SOC + Retail Price
-            [{"secondary_y": False}],
-            [{"secondary_y": False}]
-        ]
+            [{"secondary_y": True}],
+        ],
     )
-    
+
     # ==========================================================================
     # ROW 1: GRID EXCHANGE
     # ==========================================================================
-    
-    # Original demand (background)
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['demand'],
         name='Original Demand',
@@ -264,16 +411,14 @@ def create_multi_battery_dashboard(
         fillcolor='rgba(127,140,141,0.3)',
         hovertemplate='Demand: %{y:.0f} kW<extra></extra>'
     ), row=1, col=1)
-    
-    # Grid import (positive)
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['P_buy'],
         name='Grid Import',
         line=dict(color=COLORS['grid_import'], width=2),
         hovertemplate='Import: %{y:.0f} kW<extra></extra>'
     ), row=1, col=1)
-    
-    # Grid export (negative)
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=-agg_df['P_sell'],
         name='Grid Export',
@@ -282,333 +427,274 @@ def create_multi_battery_dashboard(
         fillcolor='rgba(231,76,60,0.2)',
         hovertemplate='Export: %{y:.0f} kW<extra></extra>'
     ), row=1, col=1)
-    
-    # Running peak line
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['running_peak'],
         name='Peak (Running Max)',
         line=dict(color=COLORS['peak'], width=1, dash='dot'),
         hovertemplate='Peak: %{y:.0f} kW<extra></extra>'
     ), row=1, col=1)
-    
-    # Zero line
-    fig.add_hline(y=0, line_dash="dash", line_color="black", line_width=1, row=1, col=1)
-    
-    # Price on secondary axis (faded)
+
+    fig.add_hline(y=0, line_dash='dash', line_color='black', line_width=1, row=1, col=1)
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['Price'] * 1000,
         name='DA Price',
         line=dict(color='rgba(192,57,43,0.4)', width=1),
         hovertemplate='%{y:.1f} €/MWh<extra></extra>'
     ), row=1, col=1, secondary_y=True)
-    
+
     # ==========================================================================
-    # ROW 2: BATTERY OPERATIONS (BTM vs FTM)
+    # ROW 2: Combined BTM + FTM operations
     # ==========================================================================
-    
-    # BTM charging (positive = charging)
+
     fig.add_trace(go.Bar(
         x=agg_df['datetime'], y=agg_df['P_ch_BTM'],
         name='BTM Charge',
-        marker_color=COLORS['btm_charge'],
-        opacity=0.8,
+        marker_color='rgba(230,126,34,0.85)',
         hovertemplate='BTM Charge: %{y:.0f} kW<extra></extra>'
     ), row=2, col=1)
-    
-    # BTM discharging (negative for visual)
+
     fig.add_trace(go.Bar(
         x=agg_df['datetime'], y=-agg_df['P_dis_BTM'],
         name='BTM Discharge',
-        marker_color=COLORS['btm_discharge'],
-        opacity=0.8,
+        marker_color='rgba(230,126,34,0.65)',
         hovertemplate='BTM Discharge: %{y:.0f} kW<extra></extra>'
     ), row=2, col=1)
-    
-    # FTM charging
+
     fig.add_trace(go.Bar(
         x=agg_df['datetime'], y=agg_df['P_ch_FTM'],
         name='FTM Charge',
-        marker_color=COLORS['ftm_charge'],
-        opacity=0.8,
+        marker_color='rgba(26,188,156,0.85)',
         hovertemplate='FTM Charge: %{y:.0f} kW<extra></extra>'
     ), row=2, col=1)
-    
-    # FTM discharging
+
     fig.add_trace(go.Bar(
         x=agg_df['datetime'], y=-agg_df['P_dis_FTM'],
         name='FTM Discharge',
-        marker_color=COLORS['ftm_discharge'],
-        opacity=0.8,
+        marker_color='rgba(26,188,156,0.65)',
         hovertemplate='FTM Discharge: %{y:.0f} kW<extra></extra>'
     ), row=2, col=1)
-    
-    # Zero line
-    fig.add_hline(y=0, line_dash="solid", line_color="black", line_width=1, row=2, col=1)
-    
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['Price'] * 1000,
+        name='DA Price',
+        line=dict(color='rgba(192,57,43,0.55)', width=1),
+        hovertemplate='DA Price: %{y:.1f} €/MWh<extra></extra>'
+    ), row=2, col=1, secondary_y=True)
+
+    fig.add_hline(y=0, line_dash='solid', line_color='black', line_width=1, row=2, col=1)
+
     # ==========================================================================
-    # ROW 3: FTM OVERVIEW (SOC + DA Price + FCR Price)
+    # ROW 3: BTM SOC + retail
     # ==========================================================================
-    
-    # FTM SOC (Area)
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['SOC_BTM_pct'],
+        name='BTM SOC',
+        line=dict(color=COLORS['btm_discharge'], width=2),
+        fill='tozeroy',
+        fillcolor='rgba(39,174,96,0.20)',
+        hovertemplate='BTM SOC: %{y:.1f}%<extra></extra>'
+    ), row=3, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['Price industrial'] * 1000,
+        name='Retail Price',
+        line=dict(color='rgba(44,62,80,0.55)', width=1.2, dash='dot'),
+        hovertemplate='Retail: %{y:.1f} €/MWh<extra></extra>'
+    ), row=3, col=1, secondary_y=True)
+
+    # ==========================================================================
+    # ROW 4: FTM SOC + prices
+    # ==========================================================================
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['SOC_FTM_pct'],
         name='FTM SOC',
         line=dict(color=COLORS['soc'], width=2),
         fill='tozeroy',
-        fillcolor='rgba(46, 204, 113, 0.2)',
+        fillcolor='rgba(46,204,113,0.18)',
         hovertemplate='FTM SOC: %{y:.1f}%<extra></extra>'
-    ), row=3, col=1)
+    ), row=4, col=1)
 
-    # DA Price (Line, Secondary Y)
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['Price'] * 1000,
         name='DA Price',
-        line=dict(color=COLORS['price_high'], width=1.5),
+        line=dict(color=COLORS['price_high'], width=1.2),
         hovertemplate='DA: %{y:.1f} €/MWh<extra></extra>'
-    ), row=3, col=1, secondary_y=True)
+    ), row=4, col=1, secondary_y=True)
 
-    # FCR Price (Dashed Line, Secondary Y)
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['FCR_price'] * 1000,
         name='FCR Price',
-        line=dict(color=COLORS['fcr'], width=1.5, dash='dash'),
+        line=dict(color=COLORS['fcr'], width=1.2, dash='dash'),
         hovertemplate='FCR: %{y:.1f} €/MW<extra></extra>'
-    ), row=3, col=1, secondary_y=True)
-
-    # ==========================================================================
-    # ROW 4: BTM OVERVIEW (SOC + Retail Price)
-    # ==========================================================================
-    
-    # BTM SOC (Area)
-    fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['SOC_BTM_pct'],
-        name='BTM SOC',
-        line=dict(color=COLORS['btm_charge'], width=2),
-        fill='tozeroy',
-        fillcolor='rgba(230, 126, 34, 0.2)',
-        hovertemplate='BTM SOC: %{y:.1f}%<extra></extra>'
-    ), row=4, col=1)
-
-    # Retail Price (Line, Secondary Y)
-    fig.add_trace(go.Scatter(
-        x=agg_df['datetime'], y=agg_df['Price industrial'] * 1000,
-        name='Retail Price',
-        line=dict(color='black', width=1.5, dash='dot'),
-        hovertemplate='Retail: %{y:.1f} €/MWh<extra></extra>'
     ), row=4, col=1, secondary_y=True)
-    
+
     # ==========================================================================
-    # ROW 5: FCR PARTICIPATION
+    # ROW 5: FCR reserved vs activated
     # ==========================================================================
-    
-    # FCR bid (aggregated)
+
     fig.add_trace(go.Scatter(
         x=agg_df['datetime'], y=agg_df['FCR_total'],
-        name='FCR Bid',
+        name='FCR Reserved',
         line=dict(color=COLORS['fcr'], width=2),
         fill='tozeroy',
-        fillcolor='rgba(142,68,173,0.3)',
-        hovertemplate='FCR Bid: %{y:.0f} kW<extra></extra>'
+        fillcolor='rgba(37,99,235,0.18)',
+        hovertemplate='Reserved FCR: %{y:.0f} kW<extra></extra>'
     ), row=5, col=1)
-    
-    # 1 MW minimum threshold
-    fig.add_hline(y=1000, line_dash="dot", line_color="red", line_width=2, row=5, col=1,
-                  annotation_text="1 MW Minimum", annotation_position="right")
-    
-    # FCR activation markers
-    fcr_activations = agg_df[agg_df['FCR_signal'] != 0].copy()
-    if len(fcr_activations) > 0:
-        # Positive activations (charging)
-        pos_act = fcr_activations[fcr_activations['FCR_signal'] > 0]
-        if len(pos_act) > 0:
-            fig.add_trace(go.Scatter(
-                x=pos_act['datetime'], y=pos_act['FCR_total'],
-                name='FCR Charge Event',
-                mode='markers',
-                marker=dict(color=COLORS['btm_charge'], size=12, symbol='triangle-up',
-                           line=dict(color='black', width=1)),
-                hovertemplate='FCR CHARGE: %{y:.0f} kW<extra></extra>'
-            ), row=5, col=1)
-        
-        # Negative activations (discharging)
-        neg_act = fcr_activations[fcr_activations['FCR_signal'] < 0]
-        if len(neg_act) > 0:
-            fig.add_trace(go.Scatter(
-                x=neg_act['datetime'], y=neg_act['FCR_total'],
-                name='FCR Discharge Event',
-                mode='markers',
-                marker=dict(color=COLORS['grid_export'], size=12, symbol='triangle-down',
-                           line=dict(color='black', width=1)),
-                hovertemplate='FCR DISCHARGE: %{y:.0f} kW<extra></extra>'
-            ), row=5, col=1)
-    
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['FCR_activated_power'],
+        name='Activated FCR Avg Power',
+        line=dict(color=COLORS['ftm_discharge'], width=1.7),
+        hovertemplate='Activated Avg Power: %{y:.1f} kW<extra></extra>'
+    ), row=5, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'],
+        y=np.where(agg_df['u_FCR'] > 0.5, 100, 0),
+        name='FCR Allocated Flag',
+        line=dict(color='rgba(52,73,94,0.85)', width=1, dash='dot'),
+        hovertemplate='FCR Allocated: %{y:.0f}%<extra></extra>'
+    ), row=5, col=1, secondary_y=True)
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['FCR_activation_ratio'],
+        name='Activation Ratio',
+        line=dict(color='rgba(231,76,60,0.80)', width=1),
+        hovertemplate='Activation Ratio: %{y:.1f}%<extra></extra>'
+    ), row=5, col=1, secondary_y=True)
+
+    fig.add_hline(y=1000, line_dash='dot', line_color='red', line_width=1.5, row=5, col=1,
+                  annotation_text='1 MW min bid', annotation_position='right')
+    fig.add_hline(y=0, line_dash='dash', line_color='black', line_width=1, row=5, col=1)
+
     # ==========================================================================
-    # ROW 6: MONTHLY REVENUE ATTRIBUTION
+    # ROW 6: Monthly revenue attribution
     # ==========================================================================
-    
-    # Resample to Monthly sums
-    # Ensure datetime is index
-    agg_df['datetime_idx'] = pd.to_datetime(agg_df['datetime'])
-    
-    # Pre-calculate BTM Charging Cost for Net Load Shifting
-    agg_df['val_btm_cost'] = agg_df['P_ch_BTM'] * agg_df['Price industrial'] * delta_t
-    
-    # 1. Resample sums for Energy Value
-    monthly_energy = agg_df.set_index('datetime_idx')[['val_btm_savings', 'val_da_arb', 'val_fcr', 'val_btm_cost']].resample('ME').sum()
-    
-    # Calculate Net Load Shifting (Gross Savings - Charging Cost)
-    monthly_energy['val_load_shifting'] = monthly_energy['val_btm_savings'] - monthly_energy['val_btm_cost']
-    
-    # 2. Peak savings: allocate portfolio peak_savings proportionally by
-    #    timesteps per calendar month so bars sum to the model's figure.
-    portfolio_peak_savings = financials['portfolio']['peak_savings']
-    monthly_step_counts = agg_df.set_index('datetime_idx').resample('ME').size()
-    total_steps = monthly_step_counts.sum()
-    monthly_peak_alloc = pd.DataFrame(index=monthly_step_counts.index)
-    if total_steps > 0:
-        monthly_peak_alloc['val_peak_savings'] = (
-            monthly_step_counts / total_steps * portfolio_peak_savings
-        )
-    else:
-        monthly_peak_alloc['val_peak_savings'] = 0.0
-    
-    # Merge
-    monthly_df = pd.concat([monthly_energy, monthly_peak_alloc], axis=1)
-    monthly_df['month_name'] = monthly_df.index.strftime('%B %Y')
-    
-    # Plot Stacked Bars - DETAILED REVENUE ATTRIBUTION
-    
-    # 1. Peak Shaving (prorated to simulation length, reconciled with model)
-    _peak_label = 'Peak Shaving (prorated)'
+    _peak_label = 'Peak Shaving (causal month attribution)'
     if C_peak is not None:
         _peak_label += f' — C_peak €{C_peak:.2f}/kW'
     fig.add_trace(go.Bar(
         x=monthly_df['month_name'], y=monthly_df['val_peak_savings'],
         name=_peak_label,
         marker_color=COLORS['peak'],
-        hovertemplate='Peak Shaving: €%{y:,.2f}<extra>Prorated to simulation horizon</extra>'
+        hovertemplate='Peak Shaving: €%{y:,.2f}<extra>Attributed to month of peak event</extra>'
     ), row=6, col=1)
 
-    # 2. Load Shifting (Net)
     fig.add_trace(go.Bar(
         x=monthly_df['month_name'], y=monthly_df['val_load_shifting'],
         name='Load Shifting (Net)',
         marker_color=COLORS['btm_charge'],
         hovertemplate='Load Shifting: €%{y:,.0f}<extra>Retail price arbitrage</extra>'
     ), row=6, col=1)
-    
-    # 3. DA Arbitrage
+
     fig.add_trace(go.Bar(
         x=monthly_df['month_name'], y=monthly_df['val_da_arb'],
         name='DA Arbitrage',
         marker_color=COLORS['ftm_charge'],
         hovertemplate='DA Arbitrage: €%{y:,.0f}<extra>Wholesale trading</extra>'
     ), row=6, col=1)
-    
-    # 4. FCR Revenue
+
     fig.add_trace(go.Bar(
         x=monthly_df['month_name'], y=monthly_df['val_fcr'],
         name='FCR Revenue',
         marker_color=COLORS['fcr'],
         hovertemplate='FCR Revenue: €%{y:,.0f}<extra>Frequency support</extra>'
     ), row=6, col=1)
-    
+
+    # ==========================================================================
+    # ROW 7: SOH and cumulative degradation
+    # ==========================================================================
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=100 * agg_df['SOH'],
+        name='Average SOH',
+        line=dict(color='rgba(39,174,96,0.95)', width=2),
+        hovertemplate='SOH: %{y:.3f}%<extra></extra>'
+    ), row=7, col=1)
+
+    fig.add_trace(go.Scatter(
+        x=agg_df['datetime'], y=agg_df['deg_cost_to_t'],
+        name='Cumulative Degradation Cost',
+        line=dict(color='rgba(231,76,60,0.90)', width=2),
+        fill='tozeroy',
+        fillcolor='rgba(231,76,60,0.12)',
+        hovertemplate='Cum. Degradation (model-consistent): €%{y:,.2f}<extra></extra>'
+    ), row=7, col=1, secondary_y=True)
+
     # ==========================================================================
     # LAYOUT
     # ==========================================================================
-    
+
+    annotation_text = (
+        "Battery operations: BTM (orange) and FTM (teal) shown together."
+        "<br>SOC/market section: BTM and FTM SOC with retail/DA/FCR prices."
+        "<br>Financial section: monthly value stack + SOH/degradation trend."
+    )
     fig.update_layout(
         title=dict(
             text=f'<b>VPP Portfolio Dashboard</b> — {len(site_ids)} Sites, '
                  f'{total_E_max:.0f} kWh Total Capacity',
             font=dict(size=20)
         ),
-        height=1400,
+        height=2050,
         template='plotly_white',
         hovermode='x unified',
         barmode='relative',
-        showlegend=True,
-        legend=dict(
-            orientation='h',
-            yanchor='bottom',
-            y=-0.08,
-            xanchor='center',
-            x=0.5,
-            font=dict(size=10)
-        ),
-        
-        # Add KPI annotation box with clear value attribution
-        # annotations=[
-            # dict(
-            #     text=f"<b>📊 PORTFOLIO SUMMARY</b><br>"
-            #          f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
-            #          f"Sites: {len(site_ids)} | Batteries: {total_E_max:,.0f} kWh<br>"
-            #          f"FTM (Market): {sum(c.battery.P_max*(1-c.btm_ratio) for c in site_configs):,.0f} kW<br>"
-            #          f"<br>"
-            #          f"<b>💰 COSTS</b><br>"
-            #          f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
-            #          f"Baseline (no battery): €{port['baseline_energy'] + port['baseline_peak']:,.0f}<br>"
-            #          f"Optimized cost:        €{port['energy_cost'] + port['peak_cost']:,.0f}<br>"
-            #          f"<br>"
-            #          f"<b>📈 VALUE BREAKDOWN</b><br>"
-            #          f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
-            #          f"🟢 BTM Load Shifting:  €{port['btm_savings']:>+10,.0f}<br>"
-            #          f"   (shift retail load high→low price)<br>"
-            #          f"🔵 FTM DA Arbitrage:   €{port.get('day_ahead_arbitrage', 0):>+10,.0f}<br>"
-            #          f"   (wholesale day-ahead arbitrage)<br>"
-            #          f"🟡 Peak Reduction:     €{port['peak_savings']:>+10,.0f}<br>"
-            #          f"   ({baseline_peak_kw:.0f}→{optimized_peak_kw:.0f} kW)<br>"
-            #          f"🟣 FCR Revenue:        €{port['fcr_revenue']:>+10,.0f}<br>"
-            #          f"   (capacity payments, ≥1 MW bid)<br>"
-            #          f"🔴 Degradation:        €{-port['degradation_cost']:>+10,.0f}<br>"
-            #          f"━━━━━━━━━━━━━━━━━━━━━━━━<br>"
-            #          f"<b>✅ NET BENEFIT:        €{port['net_benefit']:>+10,.0f}</b>",
-            #     xref='paper', yref='paper',
-            #     x=1.02, y=0.98,
-            #     showarrow=False,
-            #     font=dict(size=10, family='monospace'),
-            #     bgcolor='rgba(255,255,255,0.95)',
-            #     bordercolor='#34495e',
-            #     borderwidth=2,
-            #     borderpad=10,
-            #     align='left'
-            # )
-        # ]
+        showlegend=False,
+        margin=dict(t=120, b=80, l=70, r=70),
+        annotations=[
+            dict(
+                text=annotation_text,
+                xref='paper',
+                yref='paper',
+                x=0.99,
+                y=1.08,
+                xanchor='right',
+                yanchor='top',
+                showarrow=False,
+                align='left',
+                font=dict(size=11, color='rgba(44,62,80,0.95)'),
+                bgcolor='rgba(255,255,255,0.88)',
+                bordercolor='rgba(52,73,94,0.25)',
+                borderwidth=1,
+                borderpad=6,
+            )
+        ],
     )
-    
-    # Update y-axis labels
+
+    # Axis labels
     fig.update_yaxes(title_text='Power (kW)', row=1, col=1)
     fig.update_yaxes(title_text='€/MWh', row=1, col=1, secondary_y=True)
     fig.update_yaxes(title_text='Power (kW)', row=2, col=1)
-    
-    # R3: FTM
+    fig.update_yaxes(title_text='DA (€/MWh)', row=2, col=1, secondary_y=True, range=da_range)
     fig.update_yaxes(title_text='SOC (%)', row=3, col=1, range=[0, 100])
-    fig.update_yaxes(title_text='Price', row=3, col=1, secondary_y=True, autorange=True) 
-    
-    # R4: BTM
+    fig.update_yaxes(title_text='Retail (€/MWh)', row=3, col=1, secondary_y=True, range=retail_range)
     fig.update_yaxes(title_text='SOC (%)', row=4, col=1, range=[0, 100])
-    fig.update_yaxes(title_text='Retail €/MWh', row=4, col=1, secondary_y=True, autorange=True)
+    fig.update_yaxes(title_text='Price (€/MWh or €/MW)', row=4, col=1, secondary_y=True, range=row5_price_range)
+    fig.update_yaxes(title_text='Power (kW)', row=5, col=1)
+    fig.update_yaxes(title_text='Activation / Allocation (%)', row=5, col=1, secondary_y=True, range=sec_row6_activation_range)
+    fig.update_yaxes(title_text='Value (€)', row=6, col=1)
+    fig.update_yaxes(title_text='SOH (%)', row=7, col=1, range=[60, 101])
+    fig.update_yaxes(title_text='Cum. Degradation (€)', row=7, col=1, secondary_y=True, range=sec_row8_degradation_range)
 
-    fig.update_yaxes(title_text='FCR Bid (kW)', row=5, col=1)
-    fig.update_yaxes(title_text='Revenue (€)', row=6, col=1)
-    
-    # Update x-axis linkage for Rows 1-5 (Manual since shared_xaxes=False)
+    # Link time axes for rows 1-5 and row 7
     fig.update_xaxes(matches='x', row=1, col=1)
     fig.update_xaxes(matches='x', row=2, col=1)
     fig.update_xaxes(matches='x', row=3, col=1)
     fig.update_xaxes(matches='x', row=4, col=1)
     fig.update_xaxes(matches='x', row=5, col=1)
-    # Row 6 is independent
+    fig.update_xaxes(matches='x', row=7, col=1)
     fig.update_xaxes(title_text='Month', row=6, col=1)
-    
-    # Add range slider only to bottom plot
-    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.03), row=6, col=1)
-    
+    fig.update_xaxes(title_text='Time', row=7, col=1)
+    fig.update_xaxes(rangeslider=dict(visible=True, thickness=0.03), row=7, col=1)
+
     # Save
     if output_file:
         fig.write_html(str(output_file), include_plotlyjs='cdn')
         print(f"Dashboard saved to {output_file}")
-    
+
     return fig
 
 
