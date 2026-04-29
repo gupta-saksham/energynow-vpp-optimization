@@ -26,12 +26,12 @@ import argparse
 from pathlib import Path
 import sys
 
-this_file = Path(__file__).parent
+from lib.paths import OUTPUTS_DIR
 
 
 def list_available_results():
     """List all saved results files."""
-    from results_io import list_saved_results
+    from lib.results_io import list_saved_results
     
     print("\n" + "="*70)
     print("AVAILABLE SAVED RESULTS")
@@ -56,8 +56,8 @@ def list_available_results():
 
 def generate_optimization_dashboard(filepath: str = None, output_dir: Path = None):
     """Generate dashboard from single optimization results."""
-    from results_io import load_optimization_results, get_latest_results
-    from dashboard_multi_battery import (
+    from lib.results_io import load_optimization_results, get_latest_results
+    from lib.dashboard_multi_battery import (
         create_multi_battery_dashboard,
         create_detailed_site_dashboard,
         print_financial_summary,
@@ -80,10 +80,11 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     
     df = results['df']
     financials = results['financials']
+    C_peak = metadata.get('C_peak', None) if metadata else None
     
     # Setup output directory
     if output_dir is None:
-        output_dir = this_file
+        output_dir = OUTPUTS_DIR
     
     # Generate dashboards
     print("\n" + "="*70)
@@ -97,7 +98,8 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     print("\nCreating portfolio dashboard...")
     create_multi_battery_dashboard(
         df, financials, site_configs, data,
-        output_file=output_dir / "multi_battery_dashboard.html"
+        output_file=output_dir / "multi_battery_dashboard.html",
+        C_peak=C_peak,
     )
     
     # Comparison report
@@ -119,31 +121,45 @@ def generate_optimization_dashboard(filepath: str = None, output_dir: Path = Non
     print("\n" + "="*70)
     print("✓ DASHBOARDS GENERATED!")
     print("="*70)
-    print("\nFiles created:")
+    print("\nFiles created in outputs/:")
     print("  📊 multi_battery_dashboard.html")
     print("  📄 site_comparison_report.csv")
     if len(site_configs) > 0:
-        print(f"  📈 dashboard_{site_configs[0].name}.html")
+        print(f"  📈 dashboard_{site_configs[0].site_id}.html")
     
     return True
 
 
 def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     """Generate dashboards from scenario analysis results."""
-    from results_io import load_scenario_results, get_latest_results
+    from lib.results_io import load_scenario_results, get_latest_results
+    # Ensure pickle can resolve ScenarioResult when scenario_analysis was previously
+    # saved while running as `__main__`. The unpickler looks for `__main__.ScenarioResult`.
+    import scenario_analysis as _scenario_analysis
+    globals()['ScenarioResult'] = _scenario_analysis.ScenarioResult
     from scenario_analysis import (
-        create_scenario_comparison_dashboard,
-        create_detailed_insights_report,
+        create_scenario_overview_dashboard,
         create_master_navigation,
         print_scenario_summary
     )
+    from lib.paths import RESULTS_DIR
     
     # Get filepath
     if filepath is None:
         filepath = get_latest_results('scenario_analysis')
+        # Fallback: some older pickles may have `type="unknown"` in the metadata.
+        # In that case, pick the newest `scenarios_*.pkl` directly by mtime.
         if filepath is None:
-            print("❌ No scenario results found. Run scenario_analysis.py first.")
-            return False
+            scenario_pickles = sorted(
+                list(RESULTS_DIR.glob('scenarios_*.pkl')),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if len(scenario_pickles) > 0:
+                filepath = str(scenario_pickles[0])
+            else:
+                print("❌ No scenario results found. Run scenario_analysis.py first.")
+                return False
     
     # Load results
     print("\n" + "="*70)
@@ -154,7 +170,7 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     
     # Setup output directory
     if output_dir is None:
-        output_dir = this_file / "scenario_outputs"
+        output_dir = OUTPUTS_DIR / "scenario_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Print summary
@@ -172,32 +188,26 @@ def generate_scenario_dashboards(filepath: str = None, output_dir: Path = None):
     print("GENERATING SCENARIO DASHBOARDS")
     print("="*70)
     
-    print("\nCreating comparison dashboard...")
-    create_scenario_comparison_dashboard(
+    print("\nCreating merged scenario overview dashboard...")
+    create_scenario_overview_dashboard(
         results_df,
-        output_file=this_file / "scenario_comparison_dashboard.html"
-    )
-    
-    print("\nCreating insights report...")
-    create_detailed_insights_report(
-        results_df,
-        output_file=this_file / "scenario_insights.html"
+        output_file=OUTPUTS_DIR / "scenario_overview_dashboard.html",
+        scenario_data=all_results,
     )
     
     print("\nCreating master navigation...")
     create_master_navigation(
         results_df,
         output_dir=output_dir,
-        output_file=this_file / "scenario_master.html"
+        output_file=OUTPUTS_DIR / "scenario_master.html"
     )
     
     print("\n" + "="*70)
     print("✓ SCENARIO DASHBOARDS GENERATED!")
     print("="*70)
-    print("\nFiles created:")
+    print("\nFiles created in outputs/:")
     print("  🌐 scenario_master.html - Start here!")
-    print("  📊 scenario_comparison_dashboard.html")
-    print("  📈 scenario_insights.html")
+    print("  📊 scenario_overview_dashboard.html")
     
     return True
 

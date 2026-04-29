@@ -1,0 +1,27 @@
+{
+    "scenario": "BTM 100%",
+    "dates": "2024-01-01 to 2024-12-31",
+    "net_benefit": -16260.376785911634,
+    "fcr_revenue": 0.0,
+    "peak_savings": 129.98896637931207,
+    "btm_savings": 15788.661140178901,
+    "sites_count": 28
+}
+
+--- PORTFOLIO SUMMARY ---
+Total Baseline Cost:   €66,475.86
+Total Optimized Cost:  €50,557.21
+Load shifting Savings: €15,788.66
+Peak Savings:          €129.99
+Day ahead arbitrage:   €0.00
+FCR Revenue:           €0.00
+Degradation Cost:      €32,179.03
+NET BENEFIT:           €-16,260.38
+
+
+------------------------------------------------------------------------------------------
+  WITHOUT BATTERY (Baseline):
+    Energy Cost:         €      65,893  (demand × spot price)
+    Peak Charge:         €         583  (max demand × peak tariff)
+    ─────────────────────────────────────
+    TOTAL:               €      66,476

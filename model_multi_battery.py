@@ -14,7 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-this_file = Path(__file__).parent
+from lib.paths import DATA_DIR, OUTPUTS_DIR
 
 # =============================================================================
 # DATA STRUCTURES
@@ -49,7 +49,7 @@ LUNA_2000_215 = BatterySpec(
     eta_ch=0.974,
     eta_dis=0.974,
     I0=73000.0,
-    V_bat=777.0
+    V_bat=0.777
 )
 
 # =============================================================================
@@ -109,6 +109,8 @@ def filter_data_by_date_range(
     # Filter all data arrays
     filtered_data = {
         'day_ahead': data['day_ahead'][start_idx:end_idx],
+        'day_ahead_forecast': data['day_ahead_forecast'][start_idx:end_idx],
+        'industrial_tarifs': data['industrial_tarifs'][start_idx:end_idx],
         'fcr_prices': data['fcr_prices'][start_idx:end_idx],
         'site_loads': {k: v[start_idx:end_idx] for k, v in data['site_loads'].items()},
         'scale_factors': data['scale_factors'],
@@ -125,7 +127,6 @@ def filter_data_by_date_range(
     print(f"   Timesteps: {filtered_data['num_steps']} ({filtered_data['num_steps'] / 96:.1f} days)")
     
     return filtered_data
-
 
 def load_multi_site_data(
     data_dir: Path,
@@ -175,6 +176,14 @@ def load_multi_site_data(
     
     # Convert EUR/MWh to EUR/kWh
     day_ahead = day_ahead_df["Germany/Luxembourg [Eur/MWh]"] / 1000.0
+    day_ahead_forecast = day_ahead_df["Forecasted prices [Eur/MWh]"] / 1000.0
+
+    # Load industrial tarifs
+    industrial_tarifs_df = pd.read_csv(data_dir / "industrial_tarrifs.csv")
+    industrial_tarifs_averages = industrial_tarifs_df.iloc[:,2:].mean()
+    tarifs_15min = industrial_tarifs_averages.loc[industrial_tarifs_averages.index.repeat(4)].reset_index(drop=True)
+    tarifs_year = pd.concat([tarifs_15min] * 366, ignore_index=True)
+    tarifs_year = tarifs_year / 1000 # Convert EUR/MWh to EUR/kWh
     
     # --- 2. Load FCR Prices (4-hour blocks) ---
     fcr_df = pd.read_csv(data_dir / "FCR prices 2024.csv", sep=";", decimal=",")
@@ -243,6 +252,8 @@ def load_multi_site_data(
     
     full_data = {
         'day_ahead': day_ahead.values,
+        'day_ahead_forecast': day_ahead_forecast.values,
+        'industrial_tarifs': tarifs_year.values,
         'fcr_prices': fcr_prices_normalized.values,
         'site_loads': site_loads,
         'scale_factors': scale_factors,
@@ -346,7 +357,10 @@ def build_multi_battery_model(
     # SOH degradation parameters (small values for linear approximation)
     a: float = 1e-11,
     b: float = 1e-11,
-    c: float = 1e-10
+    c: float = 1e-10,
+    forecast_day_ahead: bool = False,
+    daily_cycle_limit: Optional[float] = 2.0,
+    force_disable_fcr: bool = False,
 ) -> ConcreteModel:
     """
     Build multi-site VPP optimization model.
@@ -356,13 +370,25 @@ def build_multi_battery_model(
     - FTM partitions are aggregated for FCR bidding
     - 1 MW minimum FCR bid constraint
     - Per-site peak tracking and grid exchange
+    
+    Daily cycle cap (direction-agnostic, all scheduled legs):
+    - daily_cycle_limit: max full round-trips per day per site.
+      One cycle = one full round-trip (charge E + discharge E).
+      The constraint sums P_ch_BTM + P_ch_FTM + P_dis_BTM + P_dis_FTM
+      and caps at daily_cycle_limit * 2 * E_bat_max (since one round-trip
+      moves 2E through the battery).  Set to None to disable.
     """
     
     model = ConcreteModel(name="Multi-Battery VPP")
     
     T = data['T']
-    C_buy = data['day_ahead']
-    C_sell = data['day_ahead']  # Symmetric pricing
+    C_buy_BTM = data['industrial_tarifs']
+    index_string = 'day_ahead'
+    if forecast_day_ahead:
+        index_string += '_forecast'
+    C_buy_FTM = data[index_string]
+    C_sell = data[index_string]  # Symmetric pricing
+
     C_FCR = data['fcr_prices']
     site_loads = data['site_loads']
     
@@ -391,7 +417,8 @@ def build_multi_battery_model(
     model.C_peak = Param(initialize=C_peak)
     
     # Market prices (time-indexed)
-    model.C_buy = Param(model.T, initialize=lambda m, t: C_buy[t])
+    model.C_buy_BTM = Param(model.T, initialize=lambda m, t: C_buy_BTM[t])
+    model.C_buy_FTM = Param(model.T, initialize=lambda m, t: C_buy_FTM[t])
     model.C_sell = Param(model.T, initialize=lambda m, t: C_sell[t])
     model.C_FCR = Param(model.T, initialize=lambda m, t: C_FCR[t])
     model.FCR_signal_up = Param(model.T, initialize=lambda m, t: fcr_signal_up[t])
@@ -480,8 +507,9 @@ def build_multi_battery_model(
     model.P_FCR_bid = Var(model.S, model.T, within=NonNegativeReals, bounds=ftm_power_bounds)
     
     # Grid exchange per site
+    # P_buy_BTM must always be large enough to cover demand even when btm_ratio=0
     def P_buy_BTM_bounds(m, s, t):
-        return (0, m.P_buy_max[s] * m.btm_ratio[s])
+        return (0, m.P_buy_max[s])
     model.P_buy_BTM = Var(model.S, model.T, within=NonNegativeReals, bounds=P_buy_BTM_bounds)
 
     def P_buy_FTM_bounds(m, s, t):
@@ -610,7 +638,8 @@ def build_multi_battery_model(
     model.Power_Balance_BTM = Constraint(model.S, model.T, rule=power_balance_BTM)
 
     def power_balance_FTM(m, s, t):
-        return m.P_ch_FTM[s, t] + m.P_sell[s, t] == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
+        fcr_activation = m.P_FCR_bid[s, t] * (m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 3600.0
+        return m.P_ch_FTM[s, t] + m.P_sell[s, t] + fcr_activation == m.P_buy_FTM[s, t] + m.P_dis_FTM[s, t]
     model.Power_Balance_FTM = Constraint(model.S, model.T, rule=power_balance_FTM)
     
     # Buy/Sell exclusivity
@@ -646,8 +675,18 @@ def build_multi_battery_model(
     # Total FCR bid is sum of all site contributions
     def fcr_total_def(m, t):
         return m.P_FCR_total[t] == sum(m.P_FCR_bid[s, t] for s in m.S)
-    model.FCR_Total_Def = Constraint(model.T, rule=fcr_total_def)
+    model.FCR_Total_Def = Constraint( model.T, rule=fcr_total_def)
     
+    def fcr_ch_power_limit(m, s, t):
+        return m.P_ch_FTM[s,t] <= m.P_bat_max[s]*(1-m.btm_ratio[s]) - m.P_FCR_bid[s,t]
+    
+    model.FCR_ch_power_limit = Constraint(model.S, model.T, rule=fcr_ch_power_limit)
+    
+    def fcr_dis_power_limit(m, s, t):
+        return m.P_dis_FTM[s,t] <= m.P_bat_max[s]*(1-m.btm_ratio[s]) - m.P_FCR_bid[s,t]
+    
+    model.FCR_dis_power_limit = Constraint(model.S, model.T, rule=fcr_dis_power_limit)
+
     # If participating in FCR, must bid at least 1 MW
     def fcr_min_bid(m, t):
         return m.P_FCR_total[t] >= m.u_FCR[t] * m.min_fcr_bid
@@ -683,33 +722,46 @@ def build_multi_battery_model(
         return m.P_FCR_bid[s, t] == m.P_FCR_bid[s, t-1]
     model.FCR_Site_Block = Constraint(model.S, model.T, rule=fcr_site_block_consistency)
     
+    # Completely disable FCR when requested (overrides capacity-based logic)
+    if force_disable_fcr:
+        def fcr_force_zero(m, t):
+            return m.P_FCR_total[t] == 0
+        model.FCR_Force_Zero = Constraint(model.T, rule=fcr_force_zero)
+    
     # ==========================================================================
     # CONSTRAINTS - SOH Degradation
     # ==========================================================================
     
     def soh_update(m, s, t):
+        fcr_activation_fraction = abs(m.FCR_signal_up[t] - m.FCR_signal_down[t]) / 3600.0
+        fcr_avg_power = m.P_FCR_bid[s, t] * fcr_activation_fraction  # kW (can be negative)
         total_power = (m.P_ch_BTM[s, t] + m.P_dis_BTM[s, t] + 
-                       m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t])
-        return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c * m.SOH[s, t]) * m.delta_t * 3600
+                       m.P_ch_FTM[s, t] + m.P_dis_FTM[s, t] + fcr_avg_power)
+        return m.SOH[s, t+1] == m.SOH[s, t] - (m.b * total_power / m.V_bat[s] + m.c *(m.SOC_BTM[s, t] + m.SOC_FTM[s,t])/m.E_bat_max[s]) * m.delta_t * 3600
     model.SOH_Update = Constraint(model.S, model.Tstep, rule=soh_update)
     
     # ==========================================================================
-    # CONSTRAINTS - Daily Cycle Limit (Optional: 2 full cycles/day)
+    # CONSTRAINTS - Daily Cycle Limit (configurable or disabled via None)
+    # One cycle = one full round-trip = 2 * E_bat_max of throughput.
     # ==========================================================================
     
     steps_per_day = int(24 / delta_t)
     num_days = int((T + 1) // steps_per_day)
     model.Days = RangeSet(0, max(0, num_days - 1))
     
-    def daily_cycle_limit(m, s, d):
-        start_t = d * steps_per_day
-        end_t = min(start_t + steps_per_day - 1, T)
-        daily_discharge = sum(
-            (m.P_dis_BTM[s, t] + m.P_dis_FTM[s, t]) * m.delta_t
-            for t in range(start_t, end_t + 1)
-        )
-        return daily_discharge <= 2.0 * m.E_bat_max[s]
-    model.Daily_Cycle_Limit = Constraint(model.S, model.Days, rule=daily_cycle_limit)
+    if daily_cycle_limit is not None and daily_cycle_limit > 0:
+        _cycle_limit = float(daily_cycle_limit)
+        
+        def daily_cycle_limit_rule(m, s, d):
+            start_t = d * steps_per_day
+            end_t = min(start_t + steps_per_day - 1, T)
+            daily_throughput = sum(
+                (m.P_ch_BTM[s, t] + m.P_ch_FTM[s, t]
+                 + m.P_dis_BTM[s, t] + m.P_dis_FTM[s, t]) * m.delta_t
+                for t in range(start_t, end_t + 1)
+            )
+            return daily_throughput <= _cycle_limit * 2 * m.E_bat_max[s]
+        model.Daily_Cycle_Limit = Constraint(model.S, model.Days, rule=daily_cycle_limit_rule)
     
     # ==========================================================================
     # OBJECTIVE
@@ -718,7 +770,7 @@ def build_multi_battery_model(
     def objective_rule(m):
         # Energy costs (per site)
         energy_cost = sum(
-            (m.C_buy[t] *( m.P_buy_FTM[s, t] + m.P_buy_BTM[s, t]) - m.C_sell[t] * m.P_sell[s, t]) * m.delta_t
+            (m.C_buy_FTM[t] * m.P_buy_FTM[s, t] + m.C_buy_BTM[t] * m.P_buy_BTM[s, t] - m.C_sell[t] * m.P_sell[s, t]) * m.delta_t
             for s in m.S for t in m.T
         )
         
@@ -727,7 +779,7 @@ def build_multi_battery_model(
         
         # Degradation costs (per site)
         deg_cost = sum(
-            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.8)
+            m.I0[s] * (SOH0 - m.SOH[s, T]) / (SOH0 - 0.6)
             for s in m.S
         )
         
@@ -745,6 +797,15 @@ def build_multi_battery_model(
 # RESULTS EXTRACTION
 # =============================================================================
 
+def _safe_value(var, default=0.0):
+    """Return the numeric value of a Pyomo variable, or *default* if uninitialised."""
+    try:
+        v = value(var)
+        return v if v is not None else default
+    except Exception:
+        return default
+
+
 def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.DataFrame:
     """Extract optimization results into a DataFrame for analysis."""
     
@@ -756,30 +817,33 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
         for s in site_ids:
             cfg = site_config_map[s]
             
-            # Power flows
-            p_ch_btm = value(model.P_ch_BTM[s, t])
-            p_dis_btm = value(model.P_dis_BTM[s, t])
-            p_ch_ftm = value(model.P_ch_FTM[s, t])
-            p_dis_ftm = value(model.P_dis_FTM[s, t])
-            p_fcr_bid = value(model.P_FCR_bid[s, t])
+            # Power flows (safe extraction handles edge cases like btm_ratio=0/1)
+            p_ch_btm = _safe_value(model.P_ch_BTM[s, t])
+            p_dis_btm = _safe_value(model.P_dis_BTM[s, t])
+            p_ch_ftm = _safe_value(model.P_ch_FTM[s, t])
+            p_dis_ftm = _safe_value(model.P_dis_FTM[s, t])
+            p_fcr_bid = _safe_value(model.P_FCR_bid[s, t])
             
             # Grid exchange
-            p_buy = value(model.P_buy_FTM[s, t]) + value(model.P_buy_BTM[s, t])
-            p_sell = value(model.P_sell[s, t])
+            p_buy = _safe_value(model.P_buy_FTM[s, t]) + _safe_value(model.P_buy_BTM[s, t])
+            p_buy_btm = _safe_value(model.P_buy_BTM[s, t])
+            p_buy_ftm = _safe_value(model.P_buy_FTM[s, t])
+            p_sell = _safe_value(model.P_sell[s, t])
             
             # State
-            soc_btm = value(model.SOC_BTM[s, t])
-            soc_ftm = value(model.SOC_FTM[s, t])
-            soh = value(model.SOH[s, t])
+            soc_btm = _safe_value(model.SOC_BTM[s, t])
+            soc_ftm = _safe_value(model.SOC_FTM[s, t])
+            soh = _safe_value(model.SOH[s, t], default=1.0)
             
             # Market data
-            price = value(model.C_buy[t])
+            price = data["day_ahead"][t]
+            industrial_price = value(model.C_buy_BTM[t])
             fcr_price = value(model.C_FCR[t])
             demand = value(model.D[s, t])
             
             # Aggregated FCR
-            fcr_total = value(model.P_FCR_total[t])
-            u_fcr = value(model.u_FCR[t])
+            fcr_total = _safe_value(model.P_FCR_total[t])
+            u_fcr = _safe_value(model.u_FCR[t])
             fcr_signal = value(model.FCR_signal_up[t]) - value(model.FCR_signal_down[t]) 
             
             records.append({
@@ -792,6 +856,8 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'P_dis_FTM': p_dis_ftm,
                 'P_FCR_bid': p_fcr_bid,
                 'P_buy': p_buy,
+                'P_buy_BTM': p_buy_btm,
+                'P_buy_FTM': p_buy_ftm,
                 'P_sell': p_sell,
                 'Grid_Net': p_buy - p_sell,
                 'SOC_BTM': soc_btm,
@@ -799,6 +865,7 @@ def extract_results(model, site_configs: List[SiteConfig], data: Dict) -> pd.Dat
                 'SOC_total': soc_btm + soc_ftm,
                 'SOH': soh,
                 'Price': price,
+                'Price industrial':industrial_price,
                 'FCR_price': fcr_price,
                 'FCR_total': fcr_total,
                 'u_FCR': u_fcr,
@@ -847,44 +914,54 @@ def calculate_financials(df: pd.DataFrame, site_configs: List[SiteConfig],
         site_df = df[df['site'] == site_id].copy()
         cfg = site_config_map[site_id]
         
-        # Energy costs
-        energy_cost = (site_df['P_buy'] * site_df['Price'] * delta_t).sum()
-        energy_revenue = (site_df['P_sell'] * site_df['Price'] * delta_t).sum()
-        net_energy = energy_cost - energy_revenue
+        # --- 1. Baseline Cost (No battery/optimization) ---
+        baseline_energy_cost = (site_df['demand'] * site_df['Price industrial'] * delta_t).sum()
+        baseline_peak_cost = site_df['demand'].max() * C_peak
+        baseline_total_cost = baseline_energy_cost + baseline_peak_cost
         
-        # Peak cost
-        peak_kw = site_df['P_peak'].iloc[0]
-        peak_cost = peak_kw * C_peak
-        
-        # Baseline (no battery)
-        baseline_energy = (site_df['demand'] * site_df['Price'] * delta_t).sum()
-        baseline_peak = site_df['demand'].max() * C_peak
-        
-        # BTM savings
-        btm_savings = baseline_energy - net_energy
-        peak_savings = baseline_peak - peak_cost
-        
-        # FCR revenue (allocated proportionally)
-        site_fcr_frac = site_df['P_FCR_bid'].sum() / max(df['FCR_total'].sum(), 1e-6)
-        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
+        # --- 2. Optimized Costs/Revenues from the Grid (Net Energy Cost) ---
 
-        # Degradation cost
+        cost_btm_purchase = (site_df['P_buy_BTM'] * site_df['Price industrial'] * delta_t).sum()
+        cost_ftm_purchase = (site_df['P_buy_FTM'] * site_df['Price'] * delta_t).sum()
+        revenue_ftm_sell = (site_df['P_sell'] * site_df['Price'] * delta_t).sum()
+        
+        # Net Energy Cost (Total spend on energy): 
+        net_energy_cost = cost_btm_purchase + cost_ftm_purchase - revenue_ftm_sell
+
+        # --- 3. Derived Savings/Revenues (Value Stacks) ---
+        load_shifting_savings = baseline_energy_cost - cost_btm_purchase
+        
+        peak_kw_new = site_df['P_peak'].iloc[0]
+        peak_cost_new = peak_kw_new * C_peak
+        peak_shaving_savings = baseline_peak_cost - peak_cost_new
+        
+        day_ahead_arbitrage = revenue_ftm_sell - cost_ftm_purchase
+
+        fcr_revenue = (site_df['FCR_price'] * site_df['P_FCR_bid']).sum()
+        
+        # E. Degradation Cost
+        SOH_EOL = 0.6
         soh_start = site_df['SOH'].iloc[0]
         soh_end = site_df['SOH'].iloc[-1]
-        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - 0.6)
+        deg_cost = cfg.battery.I0 * (soh_start - soh_end) / (soh_start - SOH_EOL)
+        
+        # --- 4. Final Net Benefit Check ---
+        # Net Benefit = Sum of all Savings/Revenues - Costs (Degradation)
+        net_benefit = load_shifting_savings + peak_shaving_savings + day_ahead_arbitrage + fcr_revenue - deg_cost
         
         financials['sites'][site_id] = {
-            'energy_cost': net_energy,
-            'peak_cost': peak_cost,
-            'baseline_energy': baseline_energy,
-            'baseline_peak': baseline_peak,
-            'btm_savings': btm_savings,
-            'peak_savings': peak_savings,
+            'energy_cost': net_energy_cost,
+            'peak_cost': peak_cost_new,
+            'baseline_energy': baseline_energy_cost,
+            'baseline_peak': baseline_peak_cost,
+            'btm_savings': load_shifting_savings,
+            'peak_savings': peak_shaving_savings,
+            'day_ahead_arbitrage': day_ahead_arbitrage,
             'fcr_revenue': fcr_revenue,
             'degradation_cost': deg_cost,
-            'net_benefit': btm_savings + peak_savings + fcr_revenue - deg_cost,
+            'net_benefit': net_benefit,
             'peak_kw_old': site_df['demand'].max(),
-            'peak_kw_new': peak_kw,
+            'peak_kw_new': peak_kw_new,
         }
     
     # Portfolio totals
@@ -910,6 +987,7 @@ if __name__ == "__main__":
     # CONFIGURATION: Define sites
     # =========================================================================
     
+    btm_ratio = 0.8
     # Create site configurations (using different load profiles)
     # We need 16 batteries to reach >1 MW aggregated FTM capacity
     # 16 * 108 kW * 0.6 FTM = 1036.8 kW > 1 MW minimum FCR bid
@@ -929,9 +1007,9 @@ if __name__ == "__main__":
                 eta_ch=0.974,      # Round-trip efficiency split
                 eta_dis=0.974,
                 I0=73000.0,        # Investment cost EUR
-                V_bat=777.0        # Nominal voltage
+                V_bat=0.777        # Nominal voltage
             ),
-            btm_ratio=0.4,         # 40% BTM (local load), 60% FTM (FCR)
+            btm_ratio=btm_ratio,         # 40% BTM (local load), 60% FTM (FCR)
             P_buy_max=2000.0,       # Max grid import kW
             P_sell_max=2000.0       # Max grid export kW
         ))
@@ -981,14 +1059,13 @@ if __name__ == "__main__":
     # =========================================================================
     
     data = load_multi_site_data(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         site_configs=site_configs,
         scale_loads_to_battery=True,
         scaler_input=1.0,
         start_date=START_DATE,
         end_date=END_DATE
     )
-    
     # Prorate peak tariff based on simulation period
     # (Peak charges are typically annual, so we scale for shorter periods)
     simulation_days = data['num_steps'] / 96  # 96 steps per day
@@ -998,7 +1075,7 @@ if __name__ == "__main__":
     # Load FCR activation profile for the same date range
     delta_t = 0.25
     fcr_up, fcr_down = load_fcr_activation_profile(
-        data_dir=this_file,
+        data_dir=DATA_DIR,
         start_date=START_DATE,
         end_date=END_DATE
     )
@@ -1030,6 +1107,7 @@ if __name__ == "__main__":
         SOH0=1.0,
         C_peak=C_peak,
         min_fcr_bid=1000.0,  # 1 MW
+        forecast_day_ahead=True
     )
     
     # Count model components
@@ -1121,15 +1199,17 @@ if __name__ == "__main__":
     port = financials['portfolio']
     print(f"Total Baseline Cost:   €{port['baseline_energy'] + port['baseline_peak']:,.2f}")
     print(f"Total Optimized Cost:  €{port['energy_cost'] + port['peak_cost']:,.2f}")
-    print(f"BTM Savings:           €{port['btm_savings']:,.2f}")
+    print(f"Load shifting Savings: €{port['btm_savings']:,.2f}")
     print(f"Peak Savings:          €{port['peak_savings']:,.2f}")
+    print(f"Day ahead arbitrage:   €{port['day_ahead_arbitrage']:,.2f}")
     print(f"FCR Revenue:           €{port['fcr_revenue']:,.2f}")
     print(f"Degradation Cost:      €{port['degradation_cost']:,.2f}")
     print(f"NET BENEFIT:           €{port['net_benefit']:,.2f}")
     
     # Save CSV results
-    df.to_csv(this_file / "multi_battery_results.csv", index=False)
-    print(f"\nResults saved to multi_battery_results.csv")
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUTPUTS_DIR / "multi_battery_results.csv", index=False)
+    print(f"\nResults saved to outputs/multi_battery_results.csv")
     
     # =========================================================================
     # SAVE RESULTS FOR LATER DASHBOARD GENERATION
@@ -1139,7 +1219,7 @@ if __name__ == "__main__":
     
     if SAVE_RESULTS:
         try:
-            from results_io import save_optimization_results
+            from lib.results_io import save_optimization_results
             
             results_package = {
                 'df': df,
@@ -1173,7 +1253,7 @@ if __name__ == "__main__":
         print("=" * 60)
         
         try:
-            from dashboard_multi_battery import (
+            from lib.dashboard_multi_battery import (
                 create_multi_battery_dashboard, 
                 create_detailed_site_dashboard,
                 print_financial_summary,
@@ -1187,14 +1267,15 @@ if __name__ == "__main__":
             print("\nCreating portfolio dashboard...")
             create_multi_battery_dashboard(
                 df, financials, site_configs, data, 
-                output_file=this_file / "multi_battery_dashboard.html"
+                output_file=OUTPUTS_DIR / "multi_battery_dashboard.html",
+                C_peak=C_peak,
             )
             
             # Generate comparison report CSV
             print("\nGenerating comparison report...")
             generate_comparison_report(
                 df, financials, 
-                output_file=this_file / "site_comparison_report.csv"
+                output_file=OUTPUTS_DIR / "site_comparison_report.csv"
             )
             
             # Generate detailed dashboard for first site as example
@@ -1202,13 +1283,13 @@ if __name__ == "__main__":
             print(f"\nCreating detailed dashboard for {first_site}...")
             create_detailed_site_dashboard(
                 df, first_site, financials, site_configs[0],
-                output_file=this_file / f"dashboard_{first_site}.html"
+                output_file=OUTPUTS_DIR / f"dashboard_{first_site}.html"
             )
             
             print("\n✓ All dashboards generated successfully!")
-            print(f"  - multi_battery_dashboard.html (interactive portfolio view)")
-            print(f"  - site_comparison_report.csv (site-by-site metrics)")
-            print(f"  - dashboard_{first_site}.html (detailed site view)")
+            print(f"  - outputs/multi_battery_dashboard.html (interactive portfolio view)")
+            print(f"  - outputs/site_comparison_report.csv (site-by-site metrics)")
+            print(f"  - outputs/dashboard_{first_site}.html (detailed site view)")
             
         except ImportError as e:
             print(f"\n⚠️  Dashboard generation skipped: {e}")
